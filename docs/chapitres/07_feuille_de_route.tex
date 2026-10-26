@@ -1,0 +1,367 @@
+% =============================================================================
+% Partie 5 — Démarche et feuille de route de réalisation
+% =============================================================================
+\chapter{Feuille de route de réalisation}
+
+\epigraphe{Un grand projet n'est qu'une suite de petites tâches terminées.}
+
+Cette partie est ta \textbf{liste de contrôle}. Elle reprend le projet de A à Z en six tâches, dans
+l'ordre où il faut les faire. Pour chaque tâche : l'objectif, les étapes à cocher, le résultat attendu
+et les pièges fréquents. Imprime-la ou garde-la ouverte à côté de ton éditeur.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}P{2.2cm} L P{3.2cm}@{}}
+\toprule
+\textbf{Semaine} & \textbf{Programme} & \textbf{Tâches} \\
+\midrule
+1 & Installer l'environnement, créer la base, la charger ; lire les parties 1 à 3 & 1, 2, 3 \\
+2 & Chapitre 1 : cours et exercices ; début du chapitre 2 & --- \\
+3 & Chapitre 2 : requêtes analytiques & 4 \\
+4 & Chapitre 3 : automatisation ; publication & 5, 6 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+Compte 4 à 6 heures par semaine. Rien n'empêche d'aller plus vite, mais ne saute pas les exercices
+seuls : ce sont eux qui te prépareront aux questions imprévues.
+
+% -----------------------------------------------------------------------------
+\section{Tâche 1 --- Configurer l'environnement (PostgreSQL et DBeaver)}
+
+\textbf{Objectif :} un serveur PostgreSQL qui tourne, une base vide, un outil graphique connecté et un
+environnement Python prêt. \textbf{Durée :} 1 heure.
+
+\begin{itemize}[label={}, leftmargin=1.2em]
+\tache \textbf{PostgreSQL 17.} Sur macOS, avec Homebrew :
+\begin{lstlisting}[style=shell]
+brew install postgresql@17
+brew services start postgresql@17          # démarre le serveur, et à chaque démarrage du Mac
+psql --version                             # attendu : psql (PostgreSQL) 17.x
+\end{lstlisting}
+Si \code{psql} est introuvable, ajoute son dossier au \code{PATH} (Homebrew l'indique à la fin de
+l'installation). Sur ton Mac, PostgreSQL 17 est déjà installé : vérifie seulement la version.
+\tache \textbf{La base.}
+\begin{lstlisting}[style=shell]
+createdb risk_analytics_db
+psql -d risk_analytics_db -c "SELECT version();"
+\end{lstlisting}
+\tache \textbf{DBeaver} (édition Community, gratuite) : \emph{Nouvelle connexion} $\rightarrow$
+PostgreSQL ; hôte \code{localhost}, port \code{5432}, base \code{risk_analytics_db}, utilisateur : ton nom
+d'utilisateur macOS, mot de passe vide (installation locale). Accepte le téléchargement du pilote, puis
+\emph{Tester la connexion}.
+\tache \textbf{Python.} Depuis le dossier du projet :
+\begin{lstlisting}[style=shell]
+cd ~/Desktop/Projet_SQL_Risk
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt            # numpy, pandas, Faker, SQLAlchemy, psycopg
+\end{lstlisting}
+\tache \textbf{La connexion du script.} Le chargeur lit l'adresse de la base dans la variable
+d'environnement \code{DATABASE_URL}. Sans mot de passe en local, la valeur par défaut suffit. Sinon,
+définis-la dans le terminal, \textbf{jamais dans le code} :
+\begin{lstlisting}[style=shell]
+# par défaut : postgresql://localhost/risk_analytics_db
+export DATABASE_URL="postgresql://moi:secret@localhost/risk_analytics_db"
+\end{lstlisting}
+\end{itemize}
+
+\begin{piege}{Pièges fréquents}
+\begin{itemize}
+\item \emph{role "..." does not exist} : l'utilisateur PostgreSQL n'existe pas. \code{createuser -s ton_nom}.
+\item \emph{port 5432 already in use} : un autre PostgreSQL tourne (Postgres.app, une autre version).
+Arrête-le, ou change de port.
+\item Dans DBeaver, l'onglet SQL est lié à une base : vérifie en haut de l'éditeur que c'est bien
+\code{risk_analytics_db}.
+\end{itemize}
+\end{piege}
+
+% -----------------------------------------------------------------------------
+\section{Tâche 2 --- Exécuter le script DDL}
+
+\textbf{Objectif :} créer les 6 tables, leurs contraintes et leurs index. \textbf{Durée :} 1 heure,
+lecture comprise.
+
+\begin{itemize}[label={}, leftmargin=1.2em]
+\tache Lis \code{sql/01_schema.sql} en entier, avec le dictionnaire de données de la partie 3 à côté.
+Pour chaque contrainte, demande-toi quelle erreur métier elle empêche.
+\tache Exécute-le :
+\begin{lstlisting}[style=shell]
+psql -d risk_analytics_db -v ON_ERROR_STOP=1 -f sql/01_schema.sql
+\end{lstlisting}
+Dans DBeaver : \emph{Exécuter le script} (\code{Alt+X}), et non \emph{Exécuter l'instruction}
+(\code{Ctrl+Entrée}), qui n'exécute que la requête sous le curseur.
+\tache Vérifie la structure :
+\begin{lstlisting}[style=sql]
+SELECT table_name FROM information_schema.tables
+WHERE table_schema = 'public' AND table_type = 'BASE TABLE' ORDER BY 1;     -- 6 tables
+
+SELECT contype, count(*) FROM pg_constraint                                -- c : CHECK, f : clé étrangère,
+WHERE connamespace = 'public'::regnamespace GROUP BY 1 ORDER BY 1;         -- p : clé primaire, u : UNIQUE
+
+SELECT * FROM parametres_risque;                                           -- 4 paramètres
+\end{lstlisting}
+\tache Teste une contrainte : l'insertion d'un client de 15 ans doit échouer (exercice 1.2).
+\end{itemize}
+
+\begin{resultat}
+6 tables ; 29 contraintes \code{CHECK}, 4 clés étrangères, 6 clés primaires, 3 contraintes
+\code{UNIQUE} ; 4 paramètres (\code{lgd} 0,45, \code{seuil_defaut_jours} 90, \code{seuil_stage2_jours}
+30, \code{date_reference} 2026-09-30). Les \code{NOT NULL} ne sont pas comptés : PostgreSQL 17 les stocke
+à part.
+\end{resultat}
+
+\begin{piege}{Piège --- Le script repart de zéro}
+Le script commence par \code{DROP TABLE ... CASCADE} : le relancer \textbf{efface toutes les données},
+y compris le travail des chapitres. C'est voulu pour reconstruire la base, mais ne le relance pas par
+erreur au milieu du chapitre 3.
+\end{piege}
+
+% -----------------------------------------------------------------------------
+\section{Tâche 3 --- Générer et injecter les données (Python)}
+
+\textbf{Objectif :} remplir la base avec 1,3 million de lignes cohérentes. \textbf{Durée :} 2 heures pour
+lire et comprendre le script, 15 secondes pour l'exécuter.
+
+\subsection{Le script et ses choix}
+
+Ton prompt demandait un script \textbf{Faker + Pandas + SQLAlchemy} injectant \textbf{50\,000 lignes}
+synthétiques. Le script fourni, \code{python/charger_donnees.py}, utilise bien ces trois bibliothèques,
+mais va plus loin sur un point essentiel : il part de \textbf{tes données réelles}.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}P{3.3cm} P{4.3cm} L@{}}
+\toprule
+\textbf{Demandé} & \textbf{Dans ton projet} & \textbf{Pourquoi} \\
+\midrule
+50\,000 lignes générées par Faker & 32\,409 prêts \textbf{réels} et 1,3 million de lignes au total &
+les prêts, les défauts et les prédictions de tes modèles sont réels : tu peux \textbf{valider} ta
+détection du défaut (0 désaccord sur 7\,088), ce qui est impossible avec des données inventées \\
+Faker & noms et e-mails fictifs, en français & aucune donnée personnelle ; graine fixe (2026), donc
+résultats identiques à chaque exécution \\
+Pandas & nettoyage, échéancier, paiements & calculs vectorisés : 1,1 million de mensualités en moins
+d'une seconde, sans boucle Python \\
+SQLAlchemy & connexion, transaction unique, \code{DataFrame.to_sql} & \code{to_sql} envoie des
+\code{INSERT} par défaut (plusieurs minutes) ; avec une méthode \code{COPY}, une dizaine de secondes \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Ce qui est \textbf{simulé} (le fichier source ne le contient pas) l'est de façon \textbf{cohérente
+avec le défaut réel} : un prêt qui a fait défaut cesse de payer et cumule plus de 90 jours de retard à
+la date de référence ; un prêt sain paie, avec de petits retards occasionnels.
+
+\subsection{Lecture guidée, section par section}
+
+\begin{enumerate}[leftmargin=1.6em, itemsep=0.4em]
+\item \textbf{Lecture et nettoyage.} Les règles exactes de ton projet R : suppression des doublons, âge
+au plus 100 ans, ancienneté d'emploi au plus égale à l'âge moins 14. Un \code{assert} vérifie qu'il
+reste 32\,409 prêts : si les règles divergeaient de celles du projet R, les prédictions ne
+correspondraient plus aux prêts.
+\item \textbf{Dates et durées.} Dates de demande tirées au hasard (avant fin octobre 2025 pour les prêts en
+défaut, pour qu'ils aient le temps de cumuler leurs impayés) ; durée selon le montant (12 à 60 mois) ;
+taux manquant remplacé par la médiane, avec le drapeau \code{taux_impute}.
+\item \textbf{Clients} : Faker pour les noms, e-mails construits sans accent et rendus uniques par le
+numéro de ligne.
+\item \textbf{Prêts} : tous accordés (le fichier ne contient que des prêts octroyés), statut « sain » en
+attendant le traitement de nuit du chapitre 3.
+\item \textbf{Échéancier vectorisé.} \code{np.repeat} crée une ligne par mensualité ; la formule
+d'annuité et le CRD sont calculés sur 1,1 million de lignes d'un coup ; la dernière échéance absorbe
+les arrondis ; les dates mois par mois sont bornées à la fin du mois (le piège du 31 janvier).
+\item \textbf{Paiements.} Un prêt en défaut paie $k$ mensualités puis s'arrête, en laissant au moins 5
+impayés échus ; 25~\% d'entre eux règlent une partie de leur premier impayé. Les autres paiements :
+88~\% à l'heure, 10~\% avec 1 à 20 jours de retard, 2~\% avec 31 à 75 jours (incidents régularisés).
+\item \textbf{Prédictions} : les trois modèles, leurs seuils, le champion ; les points pour la grille
+seulement, l'explication SHAP pour le champion seulement. Le fichier \code{verite_defauts.csv} est écrit
+pour l'exercice 3.4.
+\item \textbf{Chargement.} Une seule transaction : \code{TRUNCATE ... RESTART IDENTITY CASCADE}, puis
+\code{to_sql} avec la méthode \code{COPY} pour chaque table, puis le recalage des compteurs d'identité
+(\code{setval}) et un \code{ANALYZE}.
+\end{enumerate}
+
+\begin{analogie}{INSERT contre COPY}
+Envoyer un million d'\code{INSERT}, c'est poster un million de lettres d'une ligne : chacune a son
+enveloppe, son timbre, son passage au tri. \code{COPY}, c'est envoyer un seul colis contenant toutes
+les lignes. Le contenu est le même, le coût n'a rien à voir.
+\end{analogie}
+
+\subsection{Le script complet}
+
+\lstinputlisting[style=py]{../python/charger_donnees.py}
+
+\subsection{Exécution et contrôle}
+
+\begin{itemize}[label={}, leftmargin=1.2em]
+\tache Lance le script \textbf{depuis le dossier du projet} (les chemins \code{donnees/...} sont relatifs) :
+\begin{lstlisting}[style=shell]
+source .venv/bin/activate
+python python/charger_donnees.py
+\end{lstlisting}
+\begin{lstlisting}[style=sortie]
+[  0.0 s] 32409 prêts après nettoyage
+[  0.6 s] 1107936 mensualités calculées
+[  1.0 s] paiements simulés : 665512 mensualités payées, 108737 impayées échues
+[  1.6 s] clients : 32409 lignes
+[  1.9 s] demandes_pret : 32409 lignes
+[ 11.4 s] echeancier_remboursements : 1107936 lignes
+[ 12.2 s] predictions_scoring_ml : 97227 lignes
+[ 12.3 s] echantillons_modele : 32409 lignes
+[ 12.9 s] chargement terminé
+\end{lstlisting}
+\tache Vérifie les volumes dans la base :
+\begin{lstlisting}[style=sql]
+SELECT 'clients' AS table_, count(*) FROM clients
+UNION ALL SELECT 'demandes_pret', count(*) FROM demandes_pret
+UNION ALL SELECT 'echeancier_remboursements', count(*) FROM echeancier_remboursements
+UNION ALL SELECT 'predictions_scoring_ml', count(*) FROM predictions_scoring_ml
+UNION ALL SELECT 'echantillons_modele', count(*) FROM echantillons_modele;
+\end{lstlisting}
+\tache Ouvre quelques prêts dans DBeaver (les prêts 9, 61, 67) et compare avec les tableaux de la
+partie 2.
+\end{itemize}
+
+\begin{piege}{Pièges fréquents}
+\begin{itemize}
+\item \emph{FileNotFoundError: donnees/credit\_risk\_dataset.csv} : tu n'es pas dans le dossier du projet.
+\item \emph{No module named psycopg} : l'environnement virtuel n'est pas activé, ou
+\code{pip install -r requirements.txt} n'a pas été lancé.
+\item Le script vide les tables avant de les remplir : le prêt d'Awa (chapitre 1) disparaît. Relance
+l'exercice 1.1 après un rechargement.
+\end{itemize}
+\end{piege}
+
+% -----------------------------------------------------------------------------
+\section{Tâche 4 --- Rédiger les requêtes analytiques métier}
+
+\textbf{Objectif :} écrire toi-même les analyses du chapitre 2. \textbf{Durée :} une semaine.
+
+\begin{itemize}[label={}, leftmargin=1.2em]
+\tache Fais les chapitres 1 et 2 dans l'ordre, chacun dans son fichier :
+\code{sql/02_chapitre1.sql}, puis \code{sql/03_chapitre2.sql}. Commence chaque bloc par un commentaire
+qui dit quelle question métier il traite.
+\tache \textbf{Calcul du DPD} : la vue \code{v_situation_prets} (exercice 2.1).
+\tache \textbf{Analyse de portefeuille} : tranches de retard, PAR30 et PAR90 (2.1), matrice de transition
+(2.6), analyse par génération (2.7), plus grosses expositions (2.8).
+\tache \textbf{Provisions} : stages, EAD, ECL avec \code{ROLLUP} (2.2).
+\tache \textbf{Monitoring du modèle} : déciles et courbe de gains (2.3), AUC et Gini des trois modèles (2.5).
+\tache Compare chaque résultat aux valeurs du cours ; note dans ton journal les écarts et leur cause.
+\tache Mesure une requête lourde avec \code{EXPLAIN ANALYZE} (la matrice de transition), puis améliore-la.
+\end{itemize}
+
+\begin{resultat}
+PAR30 41,90~\%, PAR90 41,04~\% ; ECL 25\,627\,129,15~€ (19,13~\% de l'EAD) ; décile 1 : 45,8~\% des
+défauts captés ; AUC du champion 0,923 (Gini 0,847) contre 0,876 et 0,875 pour les challengers.
+\end{resultat}
+
+% -----------------------------------------------------------------------------
+\section{Tâche 5 --- Implémenter la détection automatique du défaut}
+
+\textbf{Objectif :} la base passe elle-même les prêts en défaut, trace et alerte. \textbf{Durée :} une
+semaine.
+
+\begin{itemize}[label={}, leftmargin=1.2em]
+\tache Crée les tables \code{journal_statuts} et \code{provisions_mensuelles} (exercice 1.3), si ce
+n'est pas fait.
+\tache Dans \code{sql/04_chapitre3.sql} : les fonctions (3.1), les trois triggers (3.2), les deux
+procédures (3.3).
+\tache Lance le premier \code{CALL actualiser_statuts();} : 18\,930 statuts mis à jour.
+\tache Teste chaque mécanisme \textbf{dans une transaction annulée} : protection de l'échéancier, scénarios
+de paiement, journal.
+\tache Valide contre la réalité : 7\,088 défauts détectés, 0 désaccord (exercice 3.4).
+\tache Fais passer le temps au 31/01/2027 et regarde le prêt d'Awa passer en défaut.
+\tache Démontre l'alerte avec deux terminaux : \code{LISTEN alertes_defaut;} dans le premier, le traitement
+de nuit dans le second.
+\tache La clôture mensuelle sur 12 mois (3.5) et, en bonus, les rôles (3.6).
+\end{itemize}
+
+% -----------------------------------------------------------------------------
+\section{Tâche 6 --- Publier sur GitHub et valoriser le projet}
+
+\textbf{Objectif :} un dépôt propre, qu'un recruteur comprend en deux minutes. \textbf{Durée :} une
+demi-journée.
+
+\subsection{Le dépôt}
+
+\begin{itemize}[label={}, leftmargin=1.2em]
+\tache Une structure claire :
+\begin{lstlisting}[style=sortie]
+Projet_SQL_Risk/
+├── README.md               la vitrine du projet
+├── requirements.txt
+├── executer.sh             reconstruit tout de zéro
+├── sql/                    01_schema.sql, 02_chapitre1.sql, 03_chapitre2.sql, 04_chapitre3.sql
+├── python/                 charger_donnees.py
+├── donnees/                sorties de tes modèles (et le jeu de données si sa licence le permet)
+└── docs/                   ce cours, le schéma de la base
+\end{lstlisting}
+\tache Un \code{.gitignore} : \code{.venv/}, \code{__pycache__/}, \code{.DS_Store}, \code{.env},
+\code{*.log}, et les fichiers temporaires de LaTeX (\code{*.aux}, \code{*.log}, \code{*.toc}\dots).
+\tache \textbf{Les données.} Vérifie la licence du \emph{Credit Risk Dataset} sur sa page Kaggle avant
+de le publier. Si elle ne le permet pas, ne versionne pas \code{credit_risk_dataset.csv} et indique dans
+le README où le télécharger.
+\tache Un script \code{executer.sh} qui reconstruit tout, preuve que ton projet est reproductible :
+\begin{lstlisting}[style=shell]
+#!/bin/sh
+set -e                                     # s'arrête à la première erreur
+psql -d risk_analytics_db -v ON_ERROR_STOP=1 -f sql/01_schema.sql
+python python/charger_donnees.py
+for f in sql/02_chapitre1.sql sql/03_chapitre2.sql sql/04_chapitre3.sql; do
+    psql -d risk_analytics_db -v ON_ERROR_STOP=1 -f "$f"
+done
+\end{lstlisting}
+\tache Des commits qui racontent l'histoire : \og Schéma : tables, contraintes et index \fg{},
+\og Chargement des données réelles par COPY \fg{}, \og Vue de situation et PAR \fg{}, \og Triggers de
+détection du défaut \fg{}\dots{} Jamais de mot de passe dans un commit.
+\tache Crée le dépôt et pousse : \code{git init}, \code{git add .}, \code{git commit}, puis
+\code{gh repo create} (ou l'interface de GitHub).
+\end{itemize}
+
+\subsection{Le README}
+
+Le README est souvent la seule chose qu'un recruteur lira. Il doit répondre en une page à quatre
+questions : quel problème, quelle solution, quels résultats, comment l'exécuter.
+
+\begin{lstlisting}[style=sortie]
+# Risk Analytics & Scoring de crédit — un backend SQL d'entreprise
+
+Système PostgreSQL qui suit 32 409 prêts réels de la demande au défaut : retards (DPD),
+provisions IFRS 9, registre des prédictions de 3 modèles de ML, détection automatique du défaut.
+
+## Résultats clés
+- Détection du défaut automatisée et validée : 7 088 défauts détectés, 0 désaccord avec la réalité
+- Provisions IFRS 9 : 25,6 M€ (19,1 % de l'exposition), dont 96,5 % en stage 3
+- Monitoring du modèle en SQL : AUC 0,923 (XGBoost) contre 0,876 (logistique)
+- 1,3 million de lignes chargées en ~13 s (COPY) ; retard d'un prêt en 0,3 ms (index partiel)
+
+## Architecture        (schéma de la base, figure de la partie 3)
+## Ce que montre le projet   (contraintes, CTE, fenêtres, triggers, procédures, rôles)
+## Lancer le projet     (prérequis, ./executer.sh)
+## Ce que j'ai appris
+\end{lstlisting}
+
+\subsection{Le portfolio et le CV}
+
+\begin{itemize}[label={}, leftmargin=1.2em]
+\tache Une carte sur ton portfolio : un titre, deux lignes de contexte, trois chiffres, le lien GitHub.
+\tache Une ligne de CV, avec des résultats mesurés :
+\begin{quote}\itshape
+Backend SQL de gestion du risque de crédit (PostgreSQL) : 32 000 prêts réels, détection automatique du
+défaut par triggers (0 écart avec la réalité), provisions IFRS 9 et monitoring de modèles de scoring
+(AUC 0,92) en SQL analytique.
+\end{quote}
+\tache Prépare un \textbf{pitch de deux minutes} : le contexte (une banque doit suivre et provisionner ses
+prêts), le problème (données éparpillées, défaut détecté à la main), ta solution (une base qui applique
+elle-même les règles), les résultats (les chiffres ci-dessus), ce que tu as appris (et ce que tu
+ferais ensuite).
+\end{itemize}
+
+\subsection{Pour aller plus loin}
+
+Si tu veux enrichir le projet après ces six tâches, quelques extensions appréciées en entretien :
+\begin{itemize}
+\item \textbf{Surveillance de la dérive} : un indice de stabilité de la population (PSI) entre les scores
+d'apprentissage et ceux des nouveaux prêts, calculé en SQL ;
+\item \textbf{Planification réelle} du traitement de nuit avec l'extension \code{pg_cron} ;
+\item \textbf{Tests automatiques} des fonctions et triggers (extension pgTAP) ;
+\item \textbf{Partitionnement} de l'échéancier par année, pour des volumes encore plus grands ;
+\item \textbf{Docker} : un \code{docker-compose.yml} qui lance PostgreSQL et charge tout en une commande ;
+\item \textbf{Un tableau de bord} (Metabase, Streamlit) branché sur les vues du chapitre 2.
+\end{itemize}

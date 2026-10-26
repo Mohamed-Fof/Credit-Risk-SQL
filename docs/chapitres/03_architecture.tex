@@ -1,0 +1,325 @@
+% =============================================================================
+% Partie 3 — Architecture de la base de données et DDL
+% =============================================================================
+\chapter{Architecture de la base et DDL}
+
+\epigraphe{On ne construit pas une maison en commençant par le toit, ni une base en commençant par les requêtes.}
+
+\begin{imagine}
+Un architecte ne commence jamais par poser des briques. Il dessine d'abord le plan : les pièces, les
+portes qui les relient, ce qui porte le poids de la maison. Une erreur sur le plan coûte un coup de
+gomme ; la même erreur une fois le mur construit coûte un chantier.
+
+Pour une base de données, c'est pareil. Le \textbf{modèle conceptuel} est le croquis, le
+\textbf{modèle relationnel} est le plan coté, et le \textbf{code DDL} est la construction.
+\end{imagine}
+
+% -----------------------------------------------------------------------------
+\section{Du besoin au modèle conceptuel}
+
+On part des phrases du métier et on repère les \textbf{entités} (les « choses » dont on garde la trace)
+et les \textbf{associations} entre elles :
+\begin{itemize}
+\item un \textbf{client} demande un ou plusieurs \textbf{prêts} ; chaque prêt appartient à un seul client ;
+\item un prêt accordé comporte plusieurs \textbf{échéances} ; un prêt refusé n'en a aucune ;
+\item un prêt est évalué par un ou plusieurs \textbf{modèles}, chaque évaluation est une \textbf{prédiction} ;
+\item un prêt appartient à l'échantillon d'apprentissage ou à l'échantillon de test du modèle ;
+\item chaque changement de statut d'un prêt est \textbf{journalisé}, et chaque fin de mois produit une
+\textbf{provision} par prêt.
+\end{itemize}
+
+La figure~\ref{fig:mcd} traduit ces phrases en \textbf{modèle conceptuel de données} (MCD, notation
+Merise). Les \textbf{cardinalités} se lisent ainsi : « un client demande au minimum 1 et au maximum
+$n$ prêts ; un prêt est demandé par exactement 1 client ».
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[font=\small,
+  entite/.style={rectangle split, rectangle split parts=2, draw=bleuML, line width=0.7pt,
+     rectangle split part fill={bleuFond, white}, text width=2.95cm, align=center, inner sep=3pt},
+  asso/.style={ellipse, draw=vertCadre, fill=vertFond, line width=0.6pt, minimum width=2cm, minimum height=0.8cm, align=center},
+  card/.style={font=\footnotesize\bfseries, fill=white, inner sep=1pt}]
+  \node[entite] (cli) at (0,0) {\textbf{CLIENT}\nodepart{two}\footnotesize âge, revenu,\\ logement, ancienneté};
+  \node[asso] (dem) at (3.25,0) {demander};
+  \node[entite] (pret) at (6.5,0) {\textbf{PRÊT}\nodepart{two}\footnotesize montant, durée,\\ taux, motif,\\ note, statuts};
+  \node[asso] (comp) at (9.75,0) {comporter};
+  \node[entite] (ech) at (12.8,0) {\textbf{ÉCHÉANCE}\nodepart{two}\footnotesize date, montant dû,\\ capital, payé};
+  \node[asso] (eval) at (6.5,-2.6) {évaluer};
+  \node[entite] (pred) at (6.5,-5) {\textbf{PRÉDICTION}\nodepart{two}\footnotesize version, PD, seuil,\\ décision, SHAP};
+  \node[asso] (aff) at (3.0,-2.6) {affecter};
+  \node[entite] (ech2) at (0,-5) {\textbf{ÉCHANTILLON}\nodepart{two}\footnotesize apprentissage\\ ou test};
+  \node[asso] (prov) at (10.1,-2.6) {provisionner};
+  \node[entite] (pm) at (12.8,-5) {\textbf{PROVISION}\nodepart{two}\footnotesize arrêté, stage,\\ EAD, PD, ECL};
+  \draw (cli) -- node[card, pos=0.3] {1,n} (dem) -- node[card, pos=0.7] {1,1} (pret);
+  \draw (pret) -- node[card, pos=0.3] {0,n} (comp) -- node[card, pos=0.7] {1,1} (ech);
+  \draw (pret) -- node[card, pos=0.4] {0,n} (eval) -- node[card, pos=0.6] {1,1} (pred);
+  \draw (pret) -- node[card, pos=0.35] {0,1} (aff) -- node[card, pos=0.6] {0,n} (ech2);
+  \draw (pret) -- node[card, pos=0.35] {0,n} (prov) -- node[card, pos=0.6] {1,1} (pm);
+\end{tikzpicture}
+\caption{Modèle conceptuel de données (simplifié). Le journal des statuts suit le même schéma que les
+provisions : un prêt en a de 0 à $n$.}
+\label{fig:mcd}
+\end{figure}
+
+\subsection{Le passage au modèle relationnel}
+
+Une seule règle suffit pour passer du croquis au plan :
+
+\begin{regle}[Règle de passage]
+Une association « un à plusieurs » devient une \textbf{clé étrangère} placée \textbf{du côté
+« plusieurs »}. Un prêt a plusieurs échéances : c'est donc l'échéance qui porte la colonne
+\code{pret_id}, et non le prêt qui porterait une liste d'échéances.
+\end{regle}
+
+On obtient le \textbf{modèle relationnel} de la figure~\ref{fig:mld} : chaque entité devient une table,
+chaque association devient une clé étrangère. On y ajoute une table technique,
+\code{parametres_risque}, qui centralise les paramètres métier.
+
+\begin{figure}[p]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >=Stealth,
+  table/.style={rectangle split, rectangle split parts=2, draw=bleuML, line width=0.7pt,
+     rectangle split part fill={bleuML, white}, text width=4.45cm, align=left, inner sep=3.5pt},
+  tabled/.style={table, draw=grisTitre, dashed, rectangle split part fill={grisTitre, white}},
+  card/.style={font=\scriptsize\bfseries, fill=white, inner sep=1pt}]
+  \node[table, anchor=north] (cli) at (0,0) {\textcolor{white}{\textbf{clients}}\nodepart{two}
+    \textbf{client\_id} \hfill PK\\ nom\_complet\\ email \hfill UNIQUE\\ age\\ revenu\_annuel\\
+    statut\_logement\\ anciennete\_emploi\\ anciennete\_credit\\ defaut\_anterieur\\ date\_inscription};
+  \node[table, anchor=north] (pret) at (5.5,0) {\textcolor{white}{\textbf{demandes\_pret}}\nodepart{two}
+    \textbf{pret\_id} \hfill PK\\ \textit{client\_id} \hfill FK\\ montant\_demande\\ duree\_mois\\
+    taux\_interet, taux\_impute\\ motif\_pret\\ note\_risque\\ date\_demande\\ date\_decision\\
+    date\_premiere\_echeance\\ statut\_dossier\\ statut\_pret};
+  \node[table, anchor=north] (ech) at (11.0,0) {\textcolor{white}{\scriptsize\textbf{echeancier\_remboursements}}\nodepart{two}
+    \textbf{echeance\_id} \hfill PK\\ \textit{pret\_id} \hfill FK\\ num\_echeance\\ date\_echeance\\
+    montant\_du\\ part\_capital\\ part\_interets\\ capital\_restant\_du\\ montant\_paye\\ date\_paiement\\[2pt]
+    {\scriptsize UNIQUE (pret\_id, num\_echeance)}};
+  \node[table, anchor=north] (pred) at (5.5,-7.3) {\textcolor{white}{\textbf{predictions\_scoring\_ml}}\nodepart{two}
+    \textbf{prediction\_id} \hfill PK\\ \textit{pret\_id} \hfill FK\\ version\_modele\\ est\_champion\\
+    probabilite\_defaut\\ score\_points\\ seuil\_decision\\ decision\\ shap\_top\_feature\\
+    shap\_top\_valeur\\ date\_prediction\\[2pt] {\scriptsize UNIQUE (pret\_id, version\_modele)}};
+  \node[table, anchor=north] (echa) at (0,-7.3) {\textcolor{white}{\textbf{echantillons\_modele}}\nodepart{two}
+    \textbf{\textit{pret\_id}} \hfill PK, FK\\ echantillon};
+  \node[table, anchor=north, draw=grisTexte, rectangle split part fill={grisTexte, white}] (par) at (0,-10.2)
+    {\textcolor{white}{\textbf{parametres\_risque}}\nodepart{two}
+    \textbf{cle} \hfill PK\\ valeur\\ valeur\_date\\ description};
+  \node[tabled, anchor=north] (jou) at (11.0,-7.3) {\textcolor{white}{\textbf{journal\_statuts}} {\scriptsize\color{white}(ch.~1)}\nodepart{two}
+    \textbf{journal\_id} \hfill PK\\ \textit{pret\_id} \hfill FK\\ ancien\_statut, nouveau\_statut\\
+    jours\_retard, date\_effet\\ enregistre\_le, enregistre\_par};
+  \node[tabled, anchor=north] (prov) at (11.0,-10.9) {\textcolor{white}{\textbf{provisions\_mensuelles}} {\scriptsize\color{white}(ch.~1)}\nodepart{two}
+    \textbf{date\_arrete, \textit{pret\_id}} \hfill PK\\ jours\_retard, stage\_ifrs9\\ ead, pd\_utilisee\\ lgd, ecl};
+  % liens
+  \draw[->, thick, bleuML] ([yshift=-0.75cm]cli.north east) -- node[card, pos=0.15] {1} node[card, pos=0.85] {n} ([yshift=-0.75cm]pret.north west);
+  \draw[<-, thick, bleuML] ([yshift=-0.75cm]ech.north west) -- node[card, pos=0.15] {n} node[card, pos=0.85] {1} ([yshift=-0.75cm]pret.north east);
+  \draw[<-, thick, bleuML] (pred.north) -- node[card, pos=0.2] {n} node[card, pos=0.8] {1} (pret.south);
+  \draw[<-, thick, bleuML] (echa.north east) -- node[card, pos=0.12] {0..1} node[card, pos=0.85] {1} (pret.south west);
+  \draw[<-, thick, grisTexte, dashed] (jou.north west) -- node[card, pos=0.12] {n} node[card, pos=0.85] {1} (pret.south east);
+  \draw[<-, thick, grisTexte, dashed] (prov.west) -- ++(-0.45,0) node[card, pos=0.5] {n} |- ($(pret.south east)+(-0.35,-0.5)$) -- ($(pret.south east)+(-0.35,0)$);
+\end{tikzpicture}
+\caption{Modèle relationnel de \code{risk_analytics_db}. En gras : clé primaire ; en italique : clé
+étrangère. Chaque flèche part de la table référencée et pointe vers la table qui porte la clé étrangère
+(le côté « n »). En pointillés : les deux tables que tu créeras dans
+l'exercice 1.3, qui référencent toutes deux \code{demandes_pret}.}
+\label{fig:mld}
+\end{figure}
+
+% -----------------------------------------------------------------------------
+\section{Les choix de conception, et pourquoi}
+
+Un recruteur ne te demandera pas de réciter le schéma. Il te demandera \textbf{pourquoi} tu l'as conçu
+ainsi. Voici les huit décisions qui font de cette base une base « d'entreprise ».
+
+\subsection*{1. NUMERIC pour l'argent, jamais FLOAT}
+Un \code{FLOAT} stocke les nombres en binaire et ne représente pas exactement 0,10. Dans PostgreSQL :
+
+\begin{lstlisting}[style=sql]
+SELECT 0.1::float8 + 0.2::float8 = 0.3::float8 AS float_egal,     -- false
+       0.1::numeric + 0.2::numeric = 0.3       AS numeric_egal,   -- true
+       (0.1::float8 + 0.2::float8)::text       AS float_valeur;   -- 0.30000000000000004
+\end{lstlisting}
+Sur un million de mensualités, ces erreurs s'accumulent et les totaux comptables ne tombent plus juste.
+\code{NUMERIC(12,2)} calcule en décimal exact, au centime.
+
+\subsection*{2. Le retard n'est pas stocké}
+Le DPD change chaque jour sans événement (partie 2). Il est calculé dans une vue à partir des dates.
+Même raisonnement pour l'encours : on le déduit des paiements.
+
+\subsection*{3. ON DELETE RESTRICT sur toutes les clés étrangères}
+Supprimer un client ne doit \textbf{jamais} effacer silencieusement ses prêts et leur historique : les
+banques ont des obligations de conservation. Avec \code{RESTRICT}, la suppression est refusée tant que
+des prêts y font référence. \code{CASCADE} serait dangereux ici.
+
+\subsection*{4. Des identifiants générés par la base}
+\code{GENERATED BY DEFAULT AS IDENTITY} pour les clients et les prêts : la base attribue un numéro,
+mais on peut fournir le sien au chargement (on garde le numéro de ligne du fichier source, ce qui relie
+chaque prêt à tes sorties R). \code{GENERATED ALWAYS} pour les échéances et les prédictions : personne
+ne doit choisir ces numéros à la main.
+
+\subsection*{5. Une table de paramètres, source unique de vérité}
+La LGD (45~\%), les seuils de 30 et 90 jours et la date de référence sont stockés dans
+\code{parametres_risque}, pas écrits en dur dans dix requêtes. Si le seuil change, on modifie une ligne.
+Une contrainte impose qu'un paramètre ait soit une valeur numérique, soit une date, jamais les deux.
+
+\subsection*{6. Des contraintes entre colonnes}
+Certaines règles portent sur plusieurs colonnes d'une même ligne. Par exemple, une décision doit être
+cohérente avec la PD et le seuil : \code{(decision = 'refuser') = (probabilite_defaut >= seuil_decision)}.
+L'égalité entre deux conditions exprime une équivalence (« si et seulement si »). On verra cette astuce
+en détail au chapitre~1.
+
+\subsection*{7. Un registre versionné des prédictions}
+Plusieurs prédictions par prêt (une par version de modèle), jamais de mise à jour, un drapeau
+\code{est_champion} pour le modèle qui décide, le seuil enregistré avec la prédiction.
+
+\subsection*{8. Deux statuts distincts}
+\code{statut_dossier} décrit la \textbf{décision} (en attente, accordé, refusé) ;
+\code{statut_pret} décrit le \textbf{remboursement} (sain, en retard, en défaut, soldé). Le second n'a de
+sens que si le premier vaut « accordé » : une contrainte l'impose.
+
+% -----------------------------------------------------------------------------
+\section{Dictionnaire de données}
+
+Pour chaque table : les colonnes, leur type PostgreSQL, leurs contraintes et leur signification.
+
+\newcommand{\dico}[1]{%
+  \par\needspace{6\baselineskip}\noindent\textbf{\large\code{#1}}\par\vspace{2pt}}
+\newenvironment{tabdico}{\noindent\footnotesize\tabularx{\linewidth}{@{}P{3.35cm} P{2.4cm} P{4.05cm} L@{}}
+  \toprule \textbf{Colonne} & \textbf{Type} & \textbf{Contraintes} & \textbf{Description} \\ \midrule}
+  {\bottomrule\endtabularx\par\medskip}
+
+\dico{clients} {\small Le référentiel des emprunteurs. 32\,409 lignes (+ Awa Koné).}\par
+\begin{tabdico}
+\code{client_id} & BIGINT & PK, identité & identifiant de l'emprunteur \\
+\code{nom_complet} & VARCHAR(100) & NOT NULL & nom fictif (Faker) \\
+\code{email} & VARCHAR(120) & NOT NULL, UNIQUE & adresse fictive \code{@exemple.fr} \\
+\code{age} & SMALLINT & NOT NULL, entre 18 et 100 & âge à la demande \\
+\code{revenu_annuel} & NUMERIC(12,2) & NOT NULL, $> 0$ & revenu annuel en euros \\
+\code{statut_logement} & VARCHAR(20) & NOT NULL, liste fermée & locataire, proprietaire, credit\_immobilier, autre \\
+\code{anciennete_emploi} & NUMERIC(4,1) & $\geq 0$, $\leq$ âge $-$ 14 & années dans l'emploi actuel ; NULL si inconnue (887 clients) \\
+\code{anciennete_credit} & SMALLINT & NOT NULL, $\geq 0$ & années d'historique de crédit \\
+\code{defaut_anterieur} & BOOLEAN & NOT NULL & un défaut a déjà été enregistré par le passé \\
+\code{date_inscription} & DATE & NOT NULL & entrée dans la banque \\
+\end{tabdico}
+
+\dico{demandes_pret} {\small Le dossier de crédit, la décision et le statut de remboursement.}\par
+\begin{tabdico}
+\code{pret_id} & BIGINT & PK, identité & numéro du prêt (= ligne du fichier source) \\
+\code{client_id} & BIGINT & NOT NULL, FK $\rightarrow$ clients, RESTRICT & l'emprunteur \\
+\code{montant_demande} & NUMERIC(12,2) & NOT NULL, $> 0$ & capital emprunté \\
+\code{duree_mois} & SMALLINT & NOT NULL, entre 6 et 120 & durée du prêt (12 à 60 mois dans les données) \\
+\code{taux_interet} & NUMERIC(5,2) & NOT NULL, $0 < t < 40$ & taux annuel en \% \\
+\code{taux_impute} & BOOLEAN & NOT NULL, défaut false & taux absent de la source, remplacé par la médiane (3\,094 prêts) \\
+\code{motif_pret} & VARCHAR(25) & NOT NULL, liste fermée & etudes, sante, creation\_entreprise, personnel, travaux, regroupement\_dettes \\
+\code{note_risque} & CHAR(1) & NOT NULL, de A à G & note interne (A = meilleur risque) \\
+\code{date_demande} & DATE & NOT NULL & dépôt du dossier \\
+\code{date_decision} & DATE & $\geq$ \code{date_demande} & décision d'octroi \\
+\code{date_premiere_echeance} & DATE & & première mensualité \\
+\code{statut_dossier} & VARCHAR(12) & NOT NULL, défaut en\_attente & en\_attente, accorde, refuse \\
+\code{statut_pret} & VARCHAR(12) & non NULL $\Leftrightarrow$ accordé & sain, en\_retard, en\_defaut, solde \\
+\end{tabdico}
+
+\dico{echeancier_remboursements} {\small Une ligne par mensualité, avec le suivi du paiement.
+1\,107\,936 lignes.}\par
+\begin{tabdico}
+\code{echeance_id} & BIGINT & PK, identité ALWAYS & identifiant technique \\
+\code{pret_id} & BIGINT & NOT NULL, FK $\rightarrow$ demandes\_pret & le prêt \\
+\code{num_echeance} & SMALLINT & NOT NULL, $> 0$ ; UNIQUE avec \code{pret_id} & rang de la mensualité (1 à $n$) \\
+\code{date_echeance} & DATE & NOT NULL & date à laquelle la mensualité est due \\
+\code{montant_du} & NUMERIC(12,2) & NOT NULL, $> 0$ & mensualité = capital + intérêts \\
+\code{part_capital} & NUMERIC(12,2) & NOT NULL, $\geq 0$ & part qui rembourse la dette \\
+\code{part_interets} & NUMERIC(12,2) & NOT NULL, $\geq 0$ & rémunération de la banque \\
+\code{capital_restant_du} & NUMERIC(12,2) & NOT NULL, $\geq 0$ & dette restante \emph{après} cette échéance \\
+\code{montant_paye} & NUMERIC(12,2) & NOT NULL, défaut 0, $\leq$ \code{montant_du} & somme déjà versée \\
+\code{date_paiement} & DATE & non NULL $\Leftrightarrow$ entièrement payée & date du paiement complet \\
+\end{tabdico}
+
+\dico{predictions_scoring_ml} {\small Le registre des prédictions : 3 modèles $\times$ 32\,409 prêts.}\par
+\begin{tabdico}
+\code{prediction_id} & BIGINT & PK, identité ALWAYS & identifiant technique \\
+\code{pret_id} & BIGINT & NOT NULL, FK & le prêt évalué \\
+\code{version_modele} & VARCHAR(40) & NOT NULL ; UNIQUE avec \code{pret_id} & grille\_score\_v1, logistique\_v1, xgboost\_monotone\_v2 \\
+\code{est_champion} & BOOLEAN & NOT NULL, défaut false & vrai pour le modèle qui décide en production \\
+\code{probabilite_defaut} & NUMERIC(7,6) & NOT NULL, entre 0 et 1 & PD prédite \\
+\code{score_points} & SMALLINT & & points de la grille de score (grille uniquement) \\
+\code{seuil_decision} & NUMERIC(4,3) & NOT NULL, entre 0 et 1 & seuil de refus du modèle \\
+\code{decision} & VARCHAR(10) & NOT NULL ; refuser $\Leftrightarrow$ PD $\geq$ seuil & accorder ou refuser \\
+\code{shap_top_feature} & VARCHAR(50) & & variable SHAP la plus influente (champion uniquement) \\
+\code{shap_top_valeur} & NUMERIC(8,4) & & sa contribution (log-odds) \\
+\code{date_prediction} & TIMESTAMP & NOT NULL & date et heure du calcul \\
+\end{tabdico}
+
+\dico{echantillons_modele} {\small Le découpage du projet R : 25\,927 prêts d'apprentissage, 6\,482 de test.}\par
+\begin{tabdico}
+\code{pret_id} & BIGINT & PK, FK $\rightarrow$ demandes\_pret & le prêt \\
+\code{echantillon} & VARCHAR(13) & NOT NULL, apprentissage ou test & échantillon d'appartenance \\
+\end{tabdico}
+
+\dico{parametres_risque} {\small Les paramètres métier (4 lignes).}\par
+\begin{tabdico}
+\code{cle} & VARCHAR(40) & PK & lgd, seuil\_defaut\_jours, seuil\_stage2\_jours, date\_reference \\
+\code{valeur} & NUMERIC & une seule des deux & valeur numérique (0,45 ; 90 ; 30) \\
+\code{valeur_date} & DATE & une seule des deux & valeur de type date (30/09/2026) \\
+\code{description} & TEXT & NOT NULL & signification et source réglementaire \\
+\end{tabdico}
+
+Les tables \code{journal_statuts} et \code{provisions_mensuelles} sont spécifiées dans l'exercice 1.3 :
+tu les concevras toi-même.
+
+% -----------------------------------------------------------------------------
+\section{Les index B-Tree}
+
+Un index est une structure annexe qui permet de retrouver des lignes sans lire toute la table (on
+verra son fonctionnement au chapitre~1). PostgreSQL crée automatiquement un index pour chaque clé
+primaire et chaque contrainte \code{UNIQUE}, mais \textbf{pas pour les clés étrangères}.
+
+\begin{center}\footnotesize
+\begin{tabularx}{\linewidth}{@{}P{4.4cm} P{3.9cm} L@{}}
+\toprule
+\textbf{Index} & \textbf{Colonnes} & \textbf{À quoi il sert} \\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Créés automatiquement}} \\
+clés primaires (\code{*_pkey}) & l'identifiant de chaque table & retrouver une ligne par son identifiant \\
+\code{clients_email_key} & \code{email} & garantir l'unicité de l'adresse \\
+\code{une_echeance_par_numero} & \code{(pret_id, num_echeance)} & unicité, et toutes les échéances d'un prêt (33~Mo) \\
+\code{une_prediction_par_version} & \code{(pret_id, version_modele)} & unicité, et les prédictions d'un prêt \\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Créés par le script}} \\
+\code{idx_prets_client} & \code{client_id} & jointure client $\rightarrow$ prêts (clé étrangère) \\
+\code{idx_prets_statut} & \code{statut_pret} & filtrer un statut rare (933 prêts en retard) ; pour un statut
+fréquent, lire la table est plus rapide \\
+\code{idx_echeances_impayees} & \code{(pret_id, date_echeance)} \textbf{partiel} : \code{WHERE montant_paye < montant_du} &
+trouver l'impayé le plus ancien d'un prêt : le calcul du retard. 13~Mo seulement, car il ne contient
+que les 442\,459 échéances non soldées \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+% -----------------------------------------------------------------------------
+\section{Le code DDL complet}
+
+Le script ci-dessous crée toute la base. Il est fourni dans \code{sql/01_schema.sql}. Lis-le en entier
+en t'appuyant sur le dictionnaire : chaque commentaire justifie un choix. Il commence par supprimer les
+tables existantes, ce qui permet de le relancer pour repartir de zéro.
+
+\lstinputlisting[style=long]{../sql/01_schema.sql}
+
+\begin{resultat}[Comment l'exécuter et ce que tu dois obtenir]
+Dans un terminal, depuis le dossier du projet :
+\begin{lstlisting}[style=shell]
+psql -d risk_analytics_db -v ON_ERROR_STOP=1 -f sql/01_schema.sql
+\end{lstlisting}
+L'option \code{ON_ERROR_STOP=1} arrête le script à la première erreur au lieu de continuer. Dans
+DBeaver : ouvre le fichier, puis \emph{Exécuter le script} (\code{Alt+X}). La commande \code{\dt} de
+psql doit lister 6 tables : \code{clients}, \code{demandes_pret}, \code{echantillons_modele},
+\code{echeancier_remboursements}, \code{parametres_risque}, \code{predictions_scoring_ml}.
+\end{resultat}
+
+\begin{resume}
+\begin{enumerate}
+\item On conçoit en trois temps : modèle conceptuel (entités, associations, cardinalités), modèle
+relationnel (tables, clés), code DDL.
+\item Une association « un à plusieurs » devient une clé étrangère du côté « plusieurs ».
+\item Les choix clés : \code{NUMERIC} pour l'argent, retard calculé et non stocké, \code{ON DELETE
+RESTRICT}, identités, table de paramètres, contraintes entre colonnes, registre versionné, deux statuts.
+\item Les clés primaires et \code{UNIQUE} sont indexées automatiquement, pas les clés étrangères. Un
+index partiel n'indexe que les lignes utiles.
+\end{enumerate}
+\end{resume}

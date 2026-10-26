@@ -1,0 +1,18 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.pyc
+.env
+
+# Système
+.DS_Store
+
+# LaTeX (le PDF du cours est versionné, pas les fichiers de compilation)
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.xdv

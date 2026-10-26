@@ -1,0 +1,852 @@
+% =============================================================================
+% Chapitre 3 — Automatisation métier : fonctions, triggers et procédures stockées
+% =============================================================================
+\chapter{Automatisation métier : triggers et procédures stockées}
+
+\epigraphe{Ce qui doit être fait à chaque fois ne doit dépendre de la mémoire de personne.}
+
+Jusqu'ici, la base \emph{stocke} et \emph{répond}. Dans ce chapitre, elle \emph{agit} : elle refuse
+qu'on modifie un contrat, recalcule le statut d'un prêt dès qu'un paiement arrive, inscrit chaque
+changement dans un journal, prévient le recouvrement d'un passage en défaut, encaisse les paiements et
+calcule les provisions de fin de mois. C'est la partie « automatisation » de ton projet, celle qui fait
+la différence entre un exercice de requêtes et un vrai système.
+
+\begin{observation}[Tes fichiers pour ce chapitre]
+\begin{itemize}
+\item Ton code : \code{sql/04_chapitre3.sql}. Le corrigé complet : \code{corriges/chapitre3.sql}.
+\item Prérequis : chapitres 1 et 2 exécutés (tables \code{journal_statuts} et
+\code{provisions_mensuelles}, vue \code{v_situation_prets}).
+\end{itemize}
+\end{observation}
+
+\begin{situation}{Mise en situation --- Le week-end où personne n'est là}
+Awa Koné n'a payé aucune mensualité depuis le 25 octobre. Le dimanche 24 janvier 2027, son retard
+atteint 91 jours : elle est en défaut au sens réglementaire. Personne n'est au bureau.
+
+Lundi matin, ta responsable veut que le prêt soit déjà \textbf{passé en défaut}, que ce changement soit
+\textbf{tracé} (qui, quand, avec quel retard), que le service de recouvrement ait été \textbf{alerté},
+et que la provision de fin de mois en tienne compte. Et pendant ce temps, l'application d'encaissement
+doit continuer à enregistrer les paiements des autres clients, sans jamais pouvoir effacer un paiement
+ni modifier un contrat.
+\end{situation}
+
+% =============================================================================
+\section{Cours et notions importantes}
+
+\subsection{Où placer la logique métier ?}
+
+Une règle métier peut vivre dans l'application (Python, Java\dots) ou dans la base. Les deux choix se
+défendent ; en entretien, on attend que tu saches les comparer.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}B{3.4cm} L L@{}}
+\toprule
+& Dans la base (fonctions, triggers) & Dans l'application \\
+\midrule
+Contournement & impossible : tous les accès passent par la base & une requête directe ou un script
+contourne la règle \\
+Cohérence & une seule implémentation & une par application qui écrit dans la base \\
+Performance & au plus près des données, ensembliste & allers-retours réseau \\
+Tests, versions & plus difficile (outils dédiés) & outils habituels du développeur \\
+Lisibilité & logique « cachée » dans la base & visible dans le code \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{regle}[La règle pratique]
+On met dans la base ce qui \textbf{ne doit jamais être contourné} : l'intégrité des données, la
+traçabilité, les règles réglementaires simples (le passage en défaut). On laisse dans l'application
+l'interface, l'orchestration et les calculs complexes (l'entraînement d'un modèle de ML, par exemple).
+\end{regle}
+
+\subsection{Les fonctions : SQL ou PL/pgSQL}
+
+Une fonction enregistre un calcul sous un nom, avec des paramètres. PostgreSQL en propose deux
+langages principaux :
+\begin{itemize}
+\item \textbf{SQL} : le corps est une simple requête. Idéal pour une formule.
+\item \textbf{PL/pgSQL} : un vrai langage procédural, avec variables, conditions, boucles et gestion des
+erreurs.
+\end{itemize}
+
+\begin{lstlisting}[style=sql]
+CREATE OR REPLACE FUNCTION fn_date_reference() RETURNS DATE
+LANGUAGE sql STABLE AS $$
+    SELECT valeur_date FROM parametres_risque WHERE cle = 'date_reference'
+$$;
+\end{lstlisting}
+
+Le corps est encadré par \code{$$ ... $$} (\emph{dollar quoting}) : tout ce qui est entre les deux est
+du texte, sans avoir à doubler les apostrophes. Un bloc PL/pgSQL a toujours la même structure :
+
+\begin{lstlisting}[style=sql]
+CREATE OR REPLACE FUNCTION fn_parametre(p_cle TEXT) RETURNS NUMERIC
+LANGUAGE plpgsql STABLE AS $$
+DECLARE                                   -- 1. les variables
+    v_valeur NUMERIC;
+BEGIN                                     -- 2. les instructions
+    SELECT valeur INTO STRICT v_valeur FROM parametres_risque WHERE cle = p_cle;
+    RETURN v_valeur;
+EXCEPTION WHEN NO_DATA_FOUND THEN         -- 3. la gestion des erreurs (facultative)
+    RAISE EXCEPTION 'Paramètre inconnu : %', p_cle;
+END $$;
+\end{lstlisting}
+
+\code{INTO STRICT} exige exactement une ligne : zéro ligne lève \code{NO_DATA_FOUND}, plusieurs lignes
+\code{TOO_MANY_ROWS}. Sans \code{STRICT}, une clé mal orthographiée donnerait silencieusement NULL, et
+tout calcul qui en dépend deviendrait NULL sans que personne ne s'en aperçoive. \code{RAISE EXCEPTION}
+annule l'instruction en cours avec un message ; les \code{\%} sont remplacés par les valeurs qui
+suivent.
+
+\subsubsection{La volatilité : promettre quelque chose à l'optimiseur}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}P{2.4cm} L P{4.8cm}@{}}
+\toprule
+\textbf{Catégorie} & \textbf{Promesse} & \textbf{Dans le projet} \\
+\midrule
+\code{IMMUTABLE} & mêmes arguments $\Rightarrow$ même résultat, pour toujours ; ne lit pas la base &
+\code{fn_pd_ifrs9} (une formule) \\
+\code{STABLE} & même résultat pendant toute une instruction ; peut lire la base & \code{fn_parametre},
+\code{fn_jours_retard} \\
+\code{VOLATILE} & aucune promesse (par défaut) ; peut modifier la base & \code{random()}, les fonctions
+de trigger \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Ces promesses permettent à PostgreSQL de calculer une fois au lieu de mille. Mentir (déclarer
+\code{IMMUTABLE} une fonction qui lit une table) peut donner des résultats faux, par exemple dans un
+index.
+
+\subsubsection{Ensembliste ou ligne à ligne}
+
+Le retard d'\textbf{un} prêt s'écrit naturellement comme une fonction, \code{fn_jours_retard(pret, date)}.
+Mais l'appeler pour 32\,410 prêts, c'est exécuter 32\,410 requêtes. Grâce à l'index partiel, chacune
+prend quelques microsecondes : 0,25 seconde au total. Sans l'index, chacune relirait 1,1 million de
+lignes : plus de 20 minutes. La version \textbf{ensembliste}, \code{fn_situation_prets(date)}, calcule
+tout le portefeuille en une seule requête et renvoie une table (\code{RETURNS TABLE}).
+
+\begin{piege}{Piège --- La fonction SQL « dépliée »}
+PostgreSQL recopie le corps d'une fonction SQL simple dans la requête qui l'appelle (\emph{inlining}).
+C'est souvent un gain, mais si l'argument est lui-même un appel de fonction, comme
+\code{fn_situation_prets(fn_date_reference())}, cet argument peut se retrouver recalculé pour chacune
+des 1,1 million de lignes parcourues : 3,5 secondes au lieu de 0,2. Écrite en PL/pgSQL, la fonction
+reçoit son argument déjà calculé, une seule fois.
+\end{piege}
+
+\subsection{Les triggers}
+
+\begin{analogie}{le détecteur de fumée}
+Un détecteur de fumée ne fait rien tant qu'il n'y a pas de fumée. Il n'a pas besoin qu'on pense à lui :
+dès que l'événement se produit, il réagit, toujours de la même façon. Un trigger est un détecteur
+installé sur une table.
+\end{analogie}
+
+\begin{definition}{Trigger (déclencheur)}
+Une fonction que PostgreSQL exécute \textbf{automatiquement} quand un événement (\code{INSERT},
+\code{UPDATE}, \code{DELETE}, \code{TRUNCATE}) touche une table. La fonction est déclarée
+\code{RETURNS trigger} ; le trigger l'attache à la table et précise quand l'appeler.
+\end{definition}
+
+\begin{lstlisting}[style=sql]
+CREATE TRIGGER trg_journal_statut
+    AFTER UPDATE OF statut_pret ON demandes_pret        -- quand : après la modification de cette colonne
+    FOR EACH ROW                                        -- pour chaque ligne modifiée
+    WHEN (OLD.statut_pret IS DISTINCT FROM NEW.statut_pret)   -- seulement si le statut change vraiment
+    EXECUTE FUNCTION fn_trg_journal_statut();           -- quoi faire
+\end{lstlisting}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}P{2.9cm} P{4.2cm} L@{}}
+\toprule
+\textbf{Choix} & \textbf{Options} & \textbf{Ce que ça change} \\
+\midrule
+Moment & \code{BEFORE}, \code{AFTER} & \code{BEFORE} peut refuser ou modifier la ligne avant écriture ;
+\code{AFTER} voit le résultat final et réagit \\
+Événement & \code{INSERT}, \code{UPDATE [OF col]}, \code{DELETE} & \code{UPDATE OF} limite le trigger à
+certaines colonnes \\
+Niveau & \code{FOR EACH ROW}, \code{FOR EACH STATEMENT} & une fois par ligne touchée, ou une fois par
+instruction \\
+Condition & \code{WHEN (...)} & la fonction n'est même pas appelée si la condition est fausse \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Dans une fonction de trigger par ligne, deux variables décrivent la ligne : \code{OLD} (avant) et
+\code{NEW} (après). La valeur renvoyée a un sens précis :
+\begin{itemize}
+\item dans un trigger \code{BEFORE} par ligne, \code{RETURN NEW} fait écrire la ligne \code{NEW}
+(éventuellement modifiée par la fonction) ; \code{RETURN NULL} annule silencieusement l'opération sur
+cette ligne ; \code{RAISE EXCEPTION} annule toute l'instruction avec une erreur ;
+\item dans un trigger \code{AFTER}, la valeur renvoyée est ignorée : on écrit \code{RETURN NULL}.
+\end{itemize}
+
+Un trigger \code{AFTER ... FOR EACH STATEMENT} peut recevoir \textbf{toutes} les lignes modifiées par
+l'instruction, sous forme de tables : les \textbf{tables de transition}.
+\begin{lstlisting}[style=sql]
+AFTER UPDATE ON echeancier_remboursements
+REFERENCING OLD TABLE AS anciennes NEW TABLE AS nouvelles   -- toutes les lignes avant / après
+FOR EACH STATEMENT EXECUTE FUNCTION ...
+\end{lstlisting}
+Une instruction qui enregistre 1\,000 paiements déclenche alors \textbf{un} recalcul ensembliste au
+lieu de 1\,000.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >=Stealth,
+  b/.style={draw, rounded corners=2pt, minimum height=0.75cm, align=center, inner sep=3pt},
+  av/.style={b, draw=orangeEx, fill=orangeFond}, ap/.style={b, draw=bleuML, fill=bleuFond},
+  ct/.style={b, draw=grisTexte, fill=grisFond}, st/.style={b, draw=vertCadre, fill=vertFond}]
+  \node[font=\small\bfseries, anchor=west] at (-0.4,0.75) {UPDATE de 2 lignes :};
+  \node[av] (a1) at (1,0) {BEFORE\\ligne 1};
+  \node[ct] (c1) at (2.75,0) {contraintes\\ligne 1};
+  \node[av] (a2) at (4.5,0) {BEFORE\\ligne 2};
+  \node[ct] (c2) at (6.25,0) {contraintes\\ligne 2};
+  \node[ap] (p1) at (8.15,0) {AFTER\\ligne 1};
+  \node[ap] (p2) at (9.9,0) {AFTER\\ligne 2};
+  \node[st] (s) at (12.1,0) {AFTER\\STATEMENT};
+  \foreach \x/\y in {a1/c1,c1/a2,a2/c2,c2/p1,p1/p2,p2/s} \draw[->, thick, grisTexte] (\x) -- (\y);
+  \draw[decorate, decoration={brace, amplitude=4pt, mirror}] (0.3,-0.55) -- (7.0,-0.55)
+     node[midway, below=5pt] {pendant l'écriture, ligne par ligne};
+  \draw[decorate, decoration={brace, amplitude=4pt, mirror}] (7.45,-0.55) -- (13.0,-0.55)
+     node[midway, below=5pt] {à la fin de l'instruction};
+\end{tikzpicture}
+\caption{L'ordre d'exécution des triggers pour une instruction qui modifie deux lignes. Si plusieurs
+triggers ont le même moment, ils s'exécutent dans l'ordre alphabétique de leur nom.}
+\label{fig:triggers}
+\end{figure}
+
+\begin{piege}{Piège --- Les triggers en cascade}
+Un trigger qui modifie une autre table peut en déclencher d'autres : dans ton projet, un paiement
+déclenche le recalcul du statut, qui déclenche le journal. C'est voulu. Mais un trigger qui modifie
+\textbf{sa propre table} se redéclenche lui-même, à l'infini. Et une erreur dans n'importe quel trigger
+annule toute l'instruction d'origine. Un trigger est aussi \textbf{invisible} pour qui lit une requête :
+documente-les.
+\end{piege}
+
+\subsection{Les procédures stockées}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}B{3.6cm} L L@{}}
+\toprule
+& \code{FUNCTION} & \code{PROCEDURE} \\
+\midrule
+Appel & dans une requête : \code{SELECT f(x)} & instruction seule : \code{CALL p(x)} \\
+Résultat & renvoie une valeur ou une table & ne renvoie rien (ou des paramètres \code{INOUT}) \\
+Transactions & ne peut pas valider & peut faire \code{COMMIT} entre deux étapes (si elle n'est pas
+appelée dans un bloc \code{BEGIN}) \\
+Usage typique & un calcul & une opération métier : encaisser, clôturer \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Une procédure PL/pgSQL utilise les mêmes briques qu'une fonction, plus quelques outils fréquents :
+\begin{lstlisting}[style=sql]
+FOR ech IN SELECT ... ORDER BY num_echeance LOOP   -- parcourir le résultat d'une requête
+    EXIT WHEN v_restant = 0;                       -- sortir de la boucle
+    ...
+END LOOP;
+GET DIAGNOSTICS v_nb = ROW_COUNT;                  -- nombre de lignes touchées par la dernière instruction
+RAISE NOTICE '% statut(s) mis à jour', v_nb;       -- un message d'information (pas une erreur)
+\end{lstlisting}
+
+\subsubsection{Deux paiements en même temps : le verrou}
+
+\begin{imagine}
+Le prêt 61 a une échéance impayée de 704,41~€. Au même instant, deux virements arrivent : 704,41~€ par
+l'application mobile, et 704,41~€ par le guichet. Les deux procédures lisent « échéance 18 impayée »,
+et les deux l'affectent à l'échéance 18. Résultat : un paiement est perdu, ou la contrainte
+\code{paiement_borne} fait échouer l'un des deux au hasard.
+\end{imagine}
+
+La solution est de \textbf{verrouiller le prêt} au début de la procédure :
+\code{SELECT ... FROM demandes_pret WHERE pret_id = p FOR UPDATE}. Le second paiement attend que le
+premier soit validé, puis voit l'échéance 18 déjà payée et passe à la 19. Les paiements du même prêt
+sont traités l'un après l'autre ; ceux des autres prêts continuent en parallèle.
+
+\subsection{Le temps qui passe : le traitement de nuit}
+
+Comme on l'a vu dans la partie 2, \textbf{le passage du temps n'est pas un événement}. Le retard d'Awa
+franchit 90 jours un dimanche sans qu'aucune ligne ne change : aucun trigger ne peut le détecter. Il faut
+une procédure, \code{actualiser_statuts()}, qui recalcule les statuts de tout le portefeuille, et un
+\textbf{ordonnanceur} qui la lance chaque nuit. Sur un serveur, c'est une ligne de \code{cron} :
+\begin{lstlisting}[style=shell]
+0 2 * * *  psql -d risk_analytics_db -c "CALL actualiser_statuts();"
+\end{lstlisting}
+ou l'extension \code{pg_cron}, qui planifie directement dans PostgreSQL. Les deux mécanismes partagent
+la même règle de statut, écrite une seule fois dans une fonction.
+
+\subsection{Rejouer sans dupliquer : l'idempotence}
+
+Une clôture mensuelle peut échouer à mi-parcours, ou devoir être relancée après une correction. Elle
+doit donner le même résultat qu'on la lance une ou trois fois : elle doit être \textbf{idempotente}.
+L'instruction \code{INSERT ... ON CONFLICT} (l'« upsert ») le permet :
+\begin{lstlisting}[style=sql]
+INSERT INTO provisions_mensuelles (date_arrete, pret_id, ...) SELECT ...
+ON CONFLICT (date_arrete, pret_id) DO UPDATE             -- la ligne existe déjà : on la remplace
+    SET ecl = EXCLUDED.ecl, ...;                          -- EXCLUDED = la ligne qu'on voulait insérer
+\end{lstlisting}
+
+\subsection{Alerter : LISTEN et NOTIFY}
+
+PostgreSQL peut envoyer des messages aux programmes connectés. Un programme s'abonne à un canal avec
+\code{LISTEN alertes_defaut} ; une fonction envoie un message avec \code{pg_notify('alertes_defaut',
+'...')}. Le message n'est délivré qu'au \textbf{moment du COMMIT} : si la transaction est annulée,
+aucune fausse alerte n'est envoyée. Voici ce que psql affiche quand le prêt d'Awa passe en défaut :
+\begin{lstlisting}[style=sortie]
+Asynchronous notification "alertes_defaut" with payload "{"pret_id" : 32582, "jours_retard" : 98}"
+received from server process with PID 87868.
+\end{lstlisting}
+Dans une application Python, la boucle \code{for n in conn.notifies(): ...} de psycopg reçoit ces
+messages et peut, par exemple, créer une tâche pour le service de recouvrement.
+
+\subsection{La sécurité : le moindre privilège}
+
+Chaque utilisateur ne doit avoir que les droits dont il a besoin. PostgreSQL gère des \textbf{rôles} et
+des droits (\code{GRANT}, \code{REVOKE}) :
+\begin{itemize}
+\item l'analyste risque \textbf{lit} tout, ne modifie rien : \code{GRANT SELECT} ;
+\item l'application d'encaissement n'écrit \textbf{jamais} directement dans les tables : elle n'a le droit
+que d'appeler \code{enregistrer_paiement}. La procédure est déclarée \code{SECURITY DEFINER} : elle
+s'exécute avec les droits de son propriétaire, et fait donc ce que l'application ne peut pas faire
+elle-même, mais seulement de la façon prévue.
+\end{itemize}
+
+\begin{piege}{Piège --- SECURITY DEFINER sans search\_path}
+Une fonction \code{SECURITY DEFINER} cherche les tables et fonctions qu'elle utilise dans le
+\code{search_path} de l'utilisateur qui l'appelle. Un utilisateur malveillant pourrait créer une fausse
+table homonyme dans son propre schéma et détourner la procédure, qui s'exécute avec des droits élevés.
+Il faut toujours figer le chemin : \code{SET search_path = public, pg_temp}.
+\end{piege}
+
+\subsection{La règle du statut}
+
+Toute l'automatisation repose sur une règle, évaluée \textbf{dans cet ordre} (la première condition
+vraie l'emporte) :
+
+\begin{center}\small
+\begin{tabular}{@{}clll@{}}
+\toprule
+Ordre & Condition & Nouveau statut & Justification \\
+\midrule
+1 & reste dû $= 0$ & \code{solde} & tout est remboursé \\
+2 & statut actuel $=$ en défaut & \code{en_defaut} & pas de sortie automatique (période probatoire) \\
+3 & DPD $> 90$ & \code{en_defaut} & article 178 du CRR \\
+4 & DPD $> 0$ & \code{en_retard} & au moins une échéance impayée \\
+5 & sinon & \code{sain} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+% =============================================================================
+\section{Exercices guidés}
+
+\begin{exercice}{3.1}{Des fonctions pour ne jamais réécrire une règle métier}
+Écris les fonctions suivantes, puis teste-les :
+\begin{enumerate}[label=\alph*)]
+\item \code{fn_parametre(cle)} (erreur explicite si la clé n'existe pas) et \code{fn_date_reference()} ;
+\item \code{fn_jours_retard(pret, date)} : le retard d'un prêt à une date quelconque, passée ou
+actuelle ;
+\item \code{fn_situation_prets(date)} : pour tout le portefeuille à cette date, le retard, l'encours, le
+reste dû et les mois restants ;
+\item \code{fn_stage_ifrs9(jours_retard)} et \code{fn_pd_ifrs9(stage, pd, mois_restants, duree)}.
+\end{enumerate}
+Tests : le retard du prêt 3 ; la concordance entre \code{fn_jours_retard} et \code{fn_situation_prets} ;
+la concordance entre \code{fn_situation_prets} et la vue du chapitre 2.
+\end{exercice}
+
+\begin{correction}{3.1}
+\textbf{a) et b)} Le retard « à une date quelconque » demande une définition plus générale que celle de
+la vue : une échéance payée \emph{après} la date $D$ était impayée \emph{à} la date $D$. D'où la
+condition \code{date_paiement IS NULL OR date_paiement > p_date}. C'est elle qui permettra, au chapitre
+suivant, de reconstituer le passé (provisions des mois précédents, matrice de transition).
+
+\begin{lstlisting}[style=long]
+-- a) Lire un paramètre : une erreur explicite vaut mieux qu'un NULL silencieux
+CREATE OR REPLACE FUNCTION fn_parametre(p_cle TEXT) RETURNS NUMERIC
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_valeur NUMERIC;
+BEGIN
+    SELECT valeur INTO STRICT v_valeur FROM parametres_risque WHERE cle = p_cle;
+    RETURN v_valeur;
+EXCEPTION WHEN NO_DATA_FOUND THEN
+    RAISE EXCEPTION 'Paramètre inconnu : %', p_cle;
+END $$;
+
+CREATE OR REPLACE FUNCTION fn_date_reference() RETURNS DATE
+LANGUAGE sql STABLE AS $$
+    SELECT valeur_date FROM parametres_risque WHERE cle = 'date_reference'
+$$;
+
+-- b) Le retard d'UN prêt à une date quelconque (passée ou actuelle)
+CREATE OR REPLACE FUNCTION fn_jours_retard(p_pret_id BIGINT, p_date DATE) RETURNS INTEGER
+LANGUAGE sql STABLE AS $$
+    SELECT coalesce(p_date - min(e.date_echeance), 0)
+    FROM echeancier_remboursements e
+    WHERE e.pret_id = p_pret_id
+      AND e.date_echeance <= p_date
+      AND (e.date_paiement IS NULL OR e.date_paiement > p_date)    -- pas encore soldée à cette date
+$$;
+\end{lstlisting}
+
+\textbf{c)} La version ensembliste, en PL/pgSQL pour éviter le piège du dépliage. \code{RETURNS TABLE}
+déclare les colonnes de sortie ; attention, leurs noms deviennent des variables dans la fonction : on
+préfixe donc toutes les colonnes des tables (\code{e.pret_id}) pour éviter toute ambiguïté.
+
+\begin{lstlisting}[style=long]
+CREATE OR REPLACE FUNCTION fn_situation_prets(p_date DATE)
+RETURNS TABLE (pret_id BIGINT, jours_retard INTEGER, encours NUMERIC, reste_du NUMERIC, mois_restants INTEGER)
+LANGUAGE plpgsql STABLE AS $$
+BEGIN
+    RETURN QUERY
+    SELECT e.pret_id,
+           coalesce(p_date - min(e.date_echeance)
+                      FILTER (WHERE e.date_echeance <= p_date
+                                AND (e.date_paiement IS NULL OR e.date_paiement > p_date)), 0),
+           -- capital non remboursé à la date : impayé partiel au prorata, soldé après la date = encore dû
+           round(sum(e.part_capital * CASE WHEN e.date_paiement IS NULL THEN 1 - e.montant_paye / e.montant_du
+                                           WHEN e.date_paiement > p_date THEN 1
+                                           ELSE 0 END), 2),
+           sum(e.montant_du - e.montant_paye),
+           (count(*) FILTER (WHERE e.date_echeance > p_date))::int
+    FROM echeancier_remboursements e
+    JOIN demandes_pret d ON d.pret_id = e.pret_id
+    WHERE d.statut_dossier = 'accorde' AND d.date_decision <= p_date
+    GROUP BY e.pret_id;                    -- colonnes préfixées (e., d.) : pas de conflit avec les noms en sortie
+END $$;
+\end{lstlisting}
+
+\textbf{d)} Les règles IFRS~9 du chapitre 2, enfin nommées et réutilisables :
+\begin{lstlisting}[style=long]
+CREATE OR REPLACE FUNCTION fn_stage_ifrs9(p_jours_retard INTEGER) RETURNS SMALLINT
+LANGUAGE sql STABLE AS $$
+    SELECT (CASE WHEN p_jours_retard > fn_parametre('seuil_defaut_jours') THEN 3
+                 WHEN p_jours_retard > fn_parametre('seuil_stage2_jours') THEN 2
+                 ELSE 1 END)::smallint
+$$;
+
+CREATE OR REPLACE FUNCTION fn_pd_ifrs9(p_stage SMALLINT, p_pd_vie NUMERIC, p_mois_restants INTEGER, p_duree INTEGER)
+RETURNS NUMERIC LANGUAGE sql IMMUTABLE AS $$
+    SELECT CASE p_stage
+               WHEN 3 THEN 1
+               WHEN 2 THEN 1 - (1 - p_pd_vie) ^ (greatest(p_mois_restants, 1)::numeric / p_duree)
+               ELSE        1 - (1 - p_pd_vie) ^ (least(greatest(p_mois_restants, 1), 12)::numeric / p_duree)
+           END
+$$;
+\end{lstlisting}
+\code{fn_stage_ifrs9} est \code{STABLE} (elle lit les paramètres), \code{fn_pd_ifrs9} est
+\code{IMMUTABLE} (une pure formule).
+
+\textbf{Les tests.} Une fonction non testée n'existe pas. On vérifie que les deux versions du calcul
+donnent la même chose, et qu'elles concordent avec la vue du chapitre 2 :
+\begin{lstlisting}[style=long]
+SELECT fn_jours_retard(3, fn_date_reference()) AS retard_pret_3;
+
+SELECT count(*) AS desaccords_fonction_vs_ensembliste          -- attendu : 0
+FROM fn_situation_prets(fn_date_reference()) s
+WHERE s.jours_retard <> fn_jours_retard(s.pret_id, fn_date_reference());
+
+SELECT count(*) AS desaccords_vue_vs_fonction                  -- attendu : 0
+FROM v_situation_prets v
+JOIN fn_situation_prets(fn_date_reference()) s USING (pret_id)
+WHERE (v.jours_retard, v.encours) IS DISTINCT FROM (s.jours_retard, s.encours);
+\end{lstlisting}
+
+\begin{resultat}
+Retard du prêt 3 : \textbf{1\,170 jours}. Désaccords : \textbf{0} et \textbf{0}.
+\end{resultat}
+La comparaison \code{(a, b) IS DISTINCT FROM (c, d)} compare deux couples d'un coup, en traitant
+correctement les NULL.
+\end{correction}
+
+\begin{exercice}{3.2}{Trois triggers : protéger, recalculer, tracer}
+\begin{enumerate}[label=\alph*)]
+\item \textbf{Protéger} l'échéancier : un \code{UPDATE} ne peut pas modifier les termes du contrat
+(numéro, date, montants, CRD) ni diminuer un montant payé. Une échéance qui devient entièrement payée
+sans date de paiement reçoit la date de référence.
+\item Écrire la \textbf{règle du statut} dans une fonction \code{fn_regle_statut(statut_actuel,
+jours_retard, reste_du)}.
+\item \textbf{Recalculer} : après chaque instruction qui modifie des montants payés, recalculer le
+statut des prêts concernés, en un seul passage.
+\item \textbf{Tracer} : chaque changement de \code{statut_pret} est inscrit dans \code{journal_statuts},
+et un passage en défaut envoie une notification sur le canal \code{alertes_defaut}.
+\end{enumerate}
+\end{exercice}
+
+\begin{correction}{3.2}
+\textbf{a) Le gardien : BEFORE UPDATE, par ligne.} Seul un trigger \code{BEFORE} peut refuser une
+modification ou compléter la ligne avant son écriture. La comparaison de deux couples par
+\code{IS DISTINCT FROM} détecte n'importe quel changement des termes du contrat, y compris vers NULL.
+
+\begin{lstlisting}[style=long]
+CREATE OR REPLACE FUNCTION fn_trg_proteger_echeance() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF (NEW.pret_id, NEW.num_echeance, NEW.date_echeance, NEW.montant_du,
+        NEW.part_capital, NEW.part_interets, NEW.capital_restant_du)
+       IS DISTINCT FROM
+       (OLD.pret_id, OLD.num_echeance, OLD.date_echeance, OLD.montant_du,
+        OLD.part_capital, OLD.part_interets, OLD.capital_restant_du) THEN
+        RAISE EXCEPTION 'Échéance % : les termes du contrat ne se modifient pas', OLD.echeance_id
+            USING HINT = 'Un changement de contrat passe par un avenant et un nouvel échéancier.';
+    END IF;
+    IF NEW.montant_paye < OLD.montant_paye THEN
+        RAISE EXCEPTION 'Échéance % : un paiement ne s''efface pas (% → %)',
+                        OLD.echeance_id, OLD.montant_paye, NEW.montant_paye
+            USING HINT = 'Enregistrer une écriture de régularisation.';
+    END IF;
+    IF NEW.montant_paye = NEW.montant_du AND NEW.date_paiement IS NULL THEN
+        NEW.date_paiement := fn_date_reference();      -- échéance soldée : la date est complétée
+    END IF;
+    RETURN NEW;                                        -- BEFORE : la ligne renvoyée est celle qui sera écrite
+END $$;
+
+DROP TRIGGER IF EXISTS trg_proteger_echeance ON echeancier_remboursements;
+CREATE TRIGGER trg_proteger_echeance
+    BEFORE UPDATE ON echeancier_remboursements
+    FOR EACH ROW EXECUTE FUNCTION fn_trg_proteger_echeance();
+\end{lstlisting}
+
+Test, avec deux instructions qui doivent échouer :
+\begin{lstlisting}[style=sql]
+UPDATE echeancier_remboursements SET montant_du = 1   WHERE echeance_id = 1;
+UPDATE echeancier_remboursements SET montant_paye = 0 WHERE echeance_id = 1;
+\end{lstlisting}
+\begin{lstlisting}[style=sortie]
+ERROR:  Échéance 1 : les termes du contrat ne se modifient pas
+HINT:  Un changement de contrat passe par un avenant et un nouvel échéancier.
+ERROR:  Échéance 1 : un paiement ne s'efface pas (88.45 → 0.00)
+HINT:  Enregistrer une écriture de régularisation.
+\end{lstlisting}
+
+\textbf{b) La règle, écrite une fois.} Elle sera utilisée par le trigger \emph{et} par le traitement de
+nuit : impossible qu'ils divergent.
+\begin{lstlisting}[style=long]
+CREATE OR REPLACE FUNCTION fn_regle_statut(p_statut_actuel VARCHAR, p_jours_retard INTEGER, p_reste_du NUMERIC)
+RETURNS VARCHAR LANGUAGE sql STABLE AS $$
+    SELECT CASE
+               WHEN p_reste_du = 0                                     THEN 'solde'
+               -- pas de sortie automatique du défaut : période probatoire et décision humaine
+               WHEN p_statut_actuel = 'en_defaut'                      THEN 'en_defaut'
+               WHEN p_jours_retard > fn_parametre('seuil_defaut_jours') THEN 'en_defaut'
+               WHEN p_jours_retard > 0                                 THEN 'en_retard'
+               ELSE                                                         'sain'
+           END
+$$;
+\end{lstlisting}
+
+\textbf{c) Le recalcul : AFTER UPDATE, par instruction, avec tables de transition.} La fonction joint
+\code{anciennes} et \code{nouvelles} pour ne garder que les prêts dont un montant payé a changé, puis
+met à jour leur statut. La condition \code{IS DISTINCT FROM} évite d'écrire (et donc de journaliser)
+un statut inchangé.
+\begin{lstlisting}[style=long]
+CREATE OR REPLACE FUNCTION fn_trg_statut_apres_paiement() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    WITH prets_payes AS (
+        SELECT DISTINCT n.pret_id
+        FROM nouvelles n
+        JOIN anciennes a USING (echeance_id)
+        WHERE n.montant_paye <> a.montant_paye
+    ),
+    recalcul AS (
+        SELECT d.pret_id,
+               fn_regle_statut(d.statut_pret,
+                               fn_jours_retard(d.pret_id, fn_date_reference()),
+                               (SELECT sum(e.montant_du - e.montant_paye)
+                                FROM echeancier_remboursements e WHERE e.pret_id = d.pret_id)) AS statut
+        FROM demandes_pret d
+        JOIN prets_payes USING (pret_id)
+    )
+    UPDATE demandes_pret d
+    SET statut_pret = r.statut
+    FROM recalcul r
+    WHERE d.pret_id = r.pret_id
+      AND d.statut_pret IS DISTINCT FROM r.statut;      -- n'écrit (et ne journalise) que les vrais changements
+    RETURN NULL;                                        -- AFTER : la valeur renvoyée est ignorée
+END $$;
+
+DROP TRIGGER IF EXISTS trg_statut_apres_paiement ON echeancier_remboursements;
+CREATE TRIGGER trg_statut_apres_paiement
+    AFTER UPDATE ON echeancier_remboursements
+    REFERENCING OLD TABLE AS anciennes NEW TABLE AS nouvelles
+    FOR EACH STATEMENT EXECUTE FUNCTION fn_trg_statut_apres_paiement();
+\end{lstlisting}
+
+\textbf{d) Le journal et l'alerte : AFTER UPDATE OF, par ligne, avec WHEN.} \code{session_user} et
+\code{now()} sont remplis par les valeurs par défaut de la table.
+\begin{lstlisting}[style=long]
+CREATE OR REPLACE FUNCTION fn_trg_journal_statut() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_retard INTEGER := fn_jours_retard(NEW.pret_id, fn_date_reference());
+BEGIN
+    INSERT INTO journal_statuts (pret_id, ancien_statut, nouveau_statut, jours_retard, date_effet)
+    VALUES (NEW.pret_id, OLD.statut_pret, NEW.statut_pret, v_retard, fn_date_reference());
+    IF NEW.statut_pret = 'en_defaut' THEN
+        -- alerte : tout programme abonné (LISTEN alertes_defaut) la reçoit quand la transaction est validée
+        PERFORM pg_notify('alertes_defaut',
+                          json_build_object('pret_id', NEW.pret_id, 'jours_retard', v_retard)::text);
+    END IF;
+    RETURN NULL;
+END $$;
+
+DROP TRIGGER IF EXISTS trg_journal_statut ON demandes_pret;
+CREATE TRIGGER trg_journal_statut
+    AFTER UPDATE OF statut_pret ON demandes_pret
+    FOR EACH ROW
+    WHEN (OLD.statut_pret IS DISTINCT FROM NEW.statut_pret)    -- la fonction n'est même pas appelée sinon
+    EXECUTE FUNCTION fn_trg_journal_statut();
+\end{lstlisting}
+
+\textbf{La chaîne complète.} Un paiement modifie \code{echeancier_remboursements} $\rightarrow$ le gardien
+le valide $\rightarrow$ le recalcul met à jour \code{demandes_pret} $\rightarrow$ le journal enregistre le
+changement et, en cas de défaut, alerte. Trois triggers, trois responsabilités.
+\end{correction}
+
+\begin{exercice}{3.3}{Deux procédures : l'encaissement et le traitement de nuit}
+\begin{enumerate}[label=\alph*)]
+\item \code{enregistrer_paiement(pret, montant, date)} : vérifie le montant et le prêt, verrouille le
+prêt, refuse un paiement supérieur au reste dû, puis affecte le paiement aux échéances impayées
+\textbf{de la plus ancienne à la plus récente}.
+\item \code{actualiser_statuts(pret)} : recalcule le statut d'un prêt, ou de tout le portefeuille si
+aucun prêt n'est donné. Lance-la une première fois : tous les prêts chargés sont « sain ».
+\item Dans une transaction annulée à la fin, joue trois scénarios : le prêt 67 règle tout son impayé
+(916,55~€) ; le prêt 61 paie 300~€ ; le prêt 9 règle tous ses impayés (9\,422,92~€). Observe les
+statuts et le journal.
+\end{enumerate}
+\end{exercice}
+
+\begin{correction}{3.3}
+\textbf{a) L'encaissement.} Les contrôles d'abord, le verrou ensuite, puis une boucle sur les échéances
+impayées dans l'ordre. Chaque \code{UPDATE} passe par le gardien ; le recalcul du statut se fait
+automatiquement, après chaque instruction.
+\begin{lstlisting}[style=long]
+CREATE OR REPLACE PROCEDURE enregistrer_paiement(p_pret_id BIGINT, p_montant NUMERIC, p_date DATE DEFAULT NULL)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_date     DATE    := coalesce(p_date, fn_date_reference());
+    v_restant  NUMERIC := p_montant;
+    v_dossier  VARCHAR;
+    v_du_total NUMERIC;
+    v_part     NUMERIC;
+    ech        RECORD;
+BEGIN
+    IF p_montant IS NULL OR p_montant <= 0 THEN
+        RAISE EXCEPTION 'Montant invalide : %', p_montant;
+    END IF;
+    -- verrou sur le prêt : deux paiements simultanés du même prêt passent l'un après l'autre
+    SELECT statut_dossier INTO v_dossier FROM demandes_pret WHERE pret_id = p_pret_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Prêt % inconnu', p_pret_id;
+    ELSIF v_dossier <> 'accorde' THEN
+        RAISE EXCEPTION 'Le prêt % n''est pas accordé', p_pret_id;
+    END IF;
+    SELECT sum(montant_du - montant_paye) INTO v_du_total
+    FROM echeancier_remboursements WHERE pret_id = p_pret_id;
+    IF p_montant > v_du_total THEN
+        RAISE EXCEPTION 'Paiement de % € supérieur au reste dû du prêt % (% €)', p_montant, p_pret_id, v_du_total;
+    END IF;
+
+    FOR ech IN
+        SELECT echeance_id, montant_du - montant_paye AS manquant
+        FROM echeancier_remboursements
+        WHERE pret_id = p_pret_id AND montant_paye < montant_du
+        ORDER BY num_echeance                          -- la plus ancienne d'abord
+    LOOP
+        EXIT WHEN v_restant = 0;
+        v_part := least(v_restant, ech.manquant);
+        UPDATE echeancier_remboursements
+        SET montant_paye  = montant_paye + v_part,
+            date_paiement = CASE WHEN montant_paye + v_part = montant_du THEN v_date END
+        WHERE echeance_id = ech.echeance_id;
+        v_restant := v_restant - v_part;
+    END LOOP;
+    RAISE NOTICE 'Prêt % : % € encaissés le %', p_pret_id, p_montant, v_date;
+END $$;
+\end{lstlisting}
+
+\textbf{b) Le traitement de nuit.} Une seule instruction ensembliste, qui réutilise les deux
+fonctions de l'exercice précédent : \code{fn_situation_prets} et \code{fn_regle_statut}. Grâce au
+paramètre \code{DEFAULT NULL}, la même procédure traite un prêt ou tout le portefeuille.
+\begin{lstlisting}[style=long]
+CREATE OR REPLACE PROCEDURE actualiser_statuts(p_pret_id BIGINT DEFAULT NULL)   -- NULL = tout le portefeuille
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_nb INTEGER;
+BEGIN
+    WITH recalcul AS (
+        SELECT d.pret_id, fn_regle_statut(d.statut_pret, s.jours_retard, s.reste_du) AS statut
+        FROM demandes_pret d
+        JOIN fn_situation_prets(fn_date_reference()) s USING (pret_id)
+        WHERE p_pret_id IS NULL OR d.pret_id = p_pret_id
+    )
+    UPDATE demandes_pret d
+    SET statut_pret = r.statut
+    FROM recalcul r
+    WHERE d.pret_id = r.pret_id AND d.statut_pret IS DISTINCT FROM r.statut;
+    GET DIAGNOSTICS v_nb = ROW_COUNT;
+    RAISE NOTICE '% statut(s) mis à jour au %', v_nb, fn_date_reference();
+END $$;
+
+-- Premier passage : tous les prêts chargés sont « sain », le traitement leur donne leur vrai statut
+CALL actualiser_statuts();
+SELECT statut_pret, count(*) AS nb_prets FROM demandes_pret GROUP BY statut_pret ORDER BY statut_pret;
+\end{lstlisting}
+
+\begin{resultat}
+\code{NOTICE: 18930 statut(s) mis à jour au 2026-09-30} : 7\,088 \code{en_defaut}, 933 \code{en_retard},
+13\,480 \code{sain}, 10\,909 \code{solde}. Le journal contient désormais 18\,930 lignes.
+\end{resultat}
+
+\textbf{c) Les scénarios.} \code{BEGIN ... ROLLBACK} : on observe tout, puis la base revient à son état
+initial.
+\begin{lstlisting}[style=long]
+BEGIN;
+CALL enregistrer_paiement(67, 916.55);     -- 1. prêt en retard de 3 jours : il règle tout son impayé
+CALL enregistrer_paiement(61, 300);        -- 2. prêt en retard de 46 jours : paiement partiel
+CALL enregistrer_paiement(9, 9422.92);     -- 3. prêt en défaut (21 mois restants) : il règle tous ses impayés
+SELECT d.pret_id, d.statut_pret, fn_jours_retard(d.pret_id, fn_date_reference()) AS jours_retard
+FROM demandes_pret d WHERE d.pret_id IN (9, 61, 67) ORDER BY d.pret_id;
+SELECT pret_id, ancien_statut, nouveau_statut, jours_retard, enregistre_par
+FROM journal_statuts WHERE enregistre_le = now() ORDER BY journal_id;    -- now() : heure de début de la transaction
+ROLLBACK;
+\end{lstlisting}
+
+\begin{resultat}
+\begin{center}\small
+\begin{tabular}{@{}cllc@{}}
+\toprule
+Prêt & Paiement & Statut après & Retard après \\
+\midrule
+67 & 916,55~€ : l'échéance du 27/09 est soldée & \textbf{sain} (était en retard) & 0 \\
+61 & 300~€ sur l'échéance de 704,41~€ du 15/08 & \code{en_retard} (inchangé) & 46 \\
+9 & 9\,422,92~€ : les 13 échéances impayées & \code{en_defaut} (inchangé) & 0 \\
+\bottomrule
+\end{tabular}
+\end{center}
+Le journal contient une seule nouvelle ligne : prêt 67, \code{en_retard} $\rightarrow$ \code{sain}.
+\end{resultat}
+
+\textbf{Lecture.} Le prêt 61 reste en retard : un paiement partiel ne solde pas l'échéance, dont la date
+ne change pas. Le prêt 9 n'a plus aucun retard, mais reste en défaut : c'est la période probatoire,
+voulue. Et le filtre \code{enregistre_le = now()} fonctionne parce que \code{now()} renvoie l'heure de
+\emph{début} de la transaction, la même pour toutes les instructions.
+\end{correction}
+
+% =============================================================================
+\section{Exercices à faire seul}
+
+\begin{exercice}{3.4}{Valider l'automatisation contre la réalité, puis faire passer le temps}
+\begin{enumerate}[label=\alph*)]
+\item Charge le fichier \code{donnees/verite_defauts.csv} (le défaut réel de chaque prêt, issu du jeu de
+données) dans une table temporaire. Les prêts que ta logique a mis \og en défaut \fg{} sont-ils
+exactement ceux qui ont fait défaut dans la réalité ? Compte les désaccords.
+\item Le prêt d'Awa (première échéance le 25/10/2026) : que se passe-t-il au 31/01/2027 si elle ne paie
+rien ? Avance la date de référence dans une transaction, regarde son statut avant et après le
+traitement de nuit, puis le journal. Annule tout à la fin.
+\end{enumerate}
+\end{exercice}
+
+\begin{indice}
+\begin{itemize}
+\item Dans psql : \code{\copy table FROM 'fichier.csv' WITH (FORMAT csv, HEADER true)}. Dans DBeaver :
+clic droit sur la table, \emph{Importer des données}.
+\item b) Un \code{UPDATE parametres_risque} suffit à « faire passer le temps » : c'est l'intérêt d'avoir
+une date de référence paramétrée.
+\end{itemize}
+\end{indice}
+
+\begin{exercice}{3.5}{La clôture mensuelle des provisions, rejouable sans doublon}
+Écris la procédure \code{cloture_mensuelle(date_arrete)}. Elle enregistre dans la table
+\code{provisions_mensuelles} la provision de chaque prêt non soldé à cette date (retard, stage, EAD, PD utilisée, LGD, ECL). Elle
+refuse une date postérieure à la date de référence et peut être relancée sans créer de doublon.
+Produis les 12 arrêtés d'octobre 2025 à septembre 2026, puis l'évolution mensuelle de l'EAD, de l'ECL
+par stage, de la \textbf{dotation nette} (variation de l'ECL d'un mois sur l'autre) et du taux de
+couverture. Vérifie l'idempotence.
+\end{exercice}
+
+\begin{indice}
+\begin{itemize}
+\item Réutilise \code{fn_situation_prets(date)} : elle sait déjà calculer le passé.
+\item \code{CROSS JOIN LATERAL (SELECT ...)} permet de calculer le stage, puis la PD qui en dépend, dans
+la même requête.
+\item Un \code{CALL} ne s'utilise pas dans un \code{SELECT} : pour boucler sur 12 dates, écris un bloc
+anonyme \code{DO $$ ... $$}.
+\item La dotation nette : \code{ecl - LAG(ecl) OVER (ORDER BY date_arrete)}.
+\end{itemize}
+\end{indice}
+
+\begin{exercice}{3.6}{Bonus --- Sécurité : chacun n'a que les droits dont il a besoin}
+Crée deux rôles : \code{analyste_risque} (lecture seule sur toutes les tables) et
+\code{application_paiement} (aucun droit sur les tables, seulement l'exécution de
+\code{enregistrer_paiement}). Rends la procédure \code{SECURITY DEFINER} de façon sûre. Vérifie, dans
+une transaction annulée, que l'application peut encaisser par la procédure mais pas écrire directement
+dans l'échéancier.
+\end{exercice}
+
+\begin{indice}
+\begin{itemize}
+\item \code{CREATE ROLE ... NOLOGIN} si le rôle n'existe pas (un bloc \code{DO} avec
+\code{IF NOT EXISTS (SELECT FROM pg_roles ...)}).
+\item \code{REVOKE ALL ON PROCEDURE ... FROM PUBLIC} : par défaut, tout le monde peut exécuter une
+procédure.
+\item Pour tester : \code{SET LOCAL ROLE application_paiement}, et l'erreur attendue s'appelle
+\code{insufficient_privilege}.
+\end{itemize}
+\end{indice}
+
+% =============================================================================
+\section{Synthèse pour les entretiens}
+
+\begin{resume}
+\begin{enumerate}
+\item On place dans la base ce qui ne doit \textbf{jamais être contourné} : intégrité, traçabilité,
+règles réglementaires simples.
+\item \textbf{Fonctions} : SQL pour une formule, PL/pgSQL pour une logique ; \code{INTO STRICT} et
+\code{RAISE EXCEPTION} pour des erreurs explicites ; volatilité \code{IMMUTABLE}, \code{STABLE},
+\code{VOLATILE}.
+\item \textbf{Triggers} : \code{BEFORE} pour valider ou compléter, \code{AFTER} pour réagir ; par ligne ou
+par instruction (tables de transition) ; \code{WHEN} pour filtrer ; attention aux cascades.
+\item \textbf{Procédures} : \code{CALL}, opérations métier, verrou \code{FOR UPDATE} contre les accès
+simultanés.
+\item \textbf{Le temps n'est pas un événement} : un traitement planifié complète les triggers, avec la
+même règle.
+\item \textbf{Idempotence} : \code{ON CONFLICT DO UPDATE}. \textbf{Alertes} : \code{pg_notify}, délivrées
+au commit. \textbf{Sécurité} : moindre privilège, \code{SECURITY DEFINER} avec \code{search_path} figé.
+\end{enumerate}
+\end{resume}
+
+\begin{entretien}
+\begin{itemize}
+\item « La détection du défaut est automatique et validée : sur 32\,409 prêts réels, ma logique trouve
+7\,088 défauts, exactement les 7\,088 du jeu de données, sans aucun désaccord. »
+\item « J'ai séparé les responsabilités : un trigger \code{BEFORE} protège le contrat, un trigger
+\code{AFTER} par instruction recalcule les statuts en un seul passage grâce aux tables de transition,
+un troisième journalise et alerte. La règle du statut est une fonction, partagée avec le traitement de
+nuit. »
+\item « Un trigger ne voit pas le temps passer : sans paiement, un retard franchit 90 jours sans
+événement. C'est pourquoi un traitement planifié complète les triggers. »
+\item « La clôture mensuelle est idempotente grâce à \code{ON CONFLICT} : on peut la relancer sans
+doublon. Et l'application d'encaissement n'a aucun droit sur les tables : elle passe par une procédure
+\code{SECURITY DEFINER} au \code{search_path} figé. »
+\end{itemize}
+\end{entretien}
+
+\subsection*{Questions fréquentes en entretien}
+
+\begin{description}[leftmargin=0pt, itemsep=0.5em]
+\item[Fonction ou procédure ?] Une fonction calcule et renvoie une valeur, utilisable dans un
+\code{SELECT} ; une procédure exécute une opération, s'appelle par \code{CALL} et peut gérer les
+transactions.
+\item[BEFORE ou AFTER ?] \code{BEFORE} pour valider ou modifier la ligne avant écriture ; \code{AFTER}
+pour réagir au résultat (journal, recalcul d'une autre table).
+\item[Quels risques avec les triggers ?] Logique invisible, cascades, récursion, coût par ligne, et une
+erreur qui annule toute l'instruction.
+\item[Comment éviter qu'un même paiement soit compté deux fois ?] Verrouiller la ligne du prêt
+(\code{FOR UPDATE}) et contraindre les montants (\code{paiement_borne}).
+\item[Qu'est-ce que l'idempotence ?] Une opération qu'on peut relancer sans changer le résultat : ici,
+une clôture rejouée remplace ses lignes au lieu de les dupliquer.
+\end{description}

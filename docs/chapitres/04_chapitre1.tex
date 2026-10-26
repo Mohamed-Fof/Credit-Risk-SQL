@@ -1,0 +1,775 @@
+% =============================================================================
+% Chapitre 1 — Modélisation, DDL et contraintes d'intégrité bancaire
+% =============================================================================
+\chapter{Modélisation, DDL et contraintes d'intégrité bancaire}
+
+\epigraphe{Une donnée fausse qui entre dans la base n'en ressort jamais seule.}
+
+Ce premier chapitre pose les fondations. Tu vas comprendre \textbf{comment on découpe} les données en
+tables, \textbf{comment on choisit} les types et les clés, et surtout \textbf{comment on empêche} une
+donnée incohérente d'entrer dans la base. Tu créeras ensuite un dossier de prêt complet, du client
+jusqu'à son tableau d'amortissement, en une seule transaction.
+
+\begin{observation}[Tes fichiers pour ce chapitre]
+\begin{itemize}
+\item Ton code : \code{sql/02_chapitre1.sql}. Le corrigé complet : \code{corriges/chapitre1.sql}.
+\item Prérequis : les tâches 1 à 3 de la partie 5 (base créée par le schéma, puis chargée par le
+script Python).
+\end{itemize}
+\end{observation}
+
+\begin{situation}{Mise en situation --- Le client de 15 ans}
+Le mois dernier, dans l'ancien tableur, un prêt a été accordé à un client de 15 ans : une faute de
+frappe, il en avait 51. Le même mois, une mensualité a été saisie deux fois comme payée, et un dossier
+refusé est apparu dans le rapport des prêts en cours. Personne ne s'en est aperçu pendant trois mois.
+
+Ta responsable est claire : \emph{« Je ne veux pas qu'on corrige ces erreurs. Je veux qu'elles soient
+impossibles. »}
+\end{situation}
+
+% =============================================================================
+\section{Cours et notions importantes}
+
+\subsection{Pourquoi plusieurs tables ? La normalisation}
+
+\begin{imagine}
+Imagine toutes les données dans un seul grand tableau, une ligne par mensualité. Pour le prêt d'Awa,
+36 lignes répètent 36 fois son nom, son revenu, son adresse e-mail, le montant de son prêt et son
+taux. Awa change d'adresse e-mail : il faut modifier 36 lignes. Tu en oublies une : la base contient
+désormais deux adresses pour la même personne. Laquelle est la bonne ?
+\end{imagine}
+
+Ce grand tableau souffre de trois \textbf{anomalies} classiques :
+\begin{itemize}
+\item \textbf{de mise à jour} : une information répétée doit être modifiée partout, sinon elle devient
+contradictoire ;
+\item \textbf{d'insertion} : impossible d'enregistrer un client tant qu'il n'a pas de mensualité ;
+\item \textbf{de suppression} : supprimer la dernière mensualité d'un prêt efface aussi le client.
+\end{itemize}
+
+\begin{definition}{Normalisation}
+Normaliser, c'est découper les données en tables de sorte que \textbf{chaque fait soit stocké une seule
+fois, à un seul endroit}. Les trois premières formes normales en donnent la méthode :
+\begin{enumerate}
+\item \textbf{1FN} : chaque cellule contient une valeur atomique (pas de liste « 25/10, 25/11, 25/12 »
+dans une case) ;
+\item \textbf{2FN} : chaque colonne dépend de \textbf{toute} la clé. Dans une table dont la clé est
+(prêt, numéro d'échéance), le montant du prêt ne dépend que du prêt : il va dans la table des prêts ;
+\item \textbf{3FN} : aucune colonne ne dépend d'une autre colonne non clé. Le revenu dépend du client,
+pas du prêt : il va dans la table des clients.
+\end{enumerate}
+\end{definition}
+
+C'est exactement ce découpage que tu as vu dans la partie 3 : \code{clients}, \code{demandes_pret},
+\code{echeancier_remboursements}. Chaque table décrit \textbf{une seule chose}, et les clés étrangères
+les relient.
+
+\begin{observation}[Normaliser la source, dénormaliser pour l'analyse]
+Pour entraîner un modèle de Machine Learning, on a besoin au contraire d'une seule grande table, une
+ligne par prêt avec toutes ses variables. On la construit \emph{à partir} de la base normalisée, par
+des jointures, dans une vue ou un entrepôt de données. La règle : le système qui enregistre les
+opérations reste normalisé ; les tables d'analyse peuvent être dénormalisées.
+\end{observation}
+
+\subsection{Choisir les types de données}
+
+Le type d'une colonne est la première contrainte : il refuse tout ce qui n'a pas la bonne forme.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}P{3.1cm} P{3.6cm} L@{}}
+\toprule
+\textbf{Type} & \textbf{Dans le projet} & \textbf{À savoir} \\
+\midrule
+\code{SMALLINT}, \code{INTEGER}, \code{BIGINT} & âge, durée ; identifiants & 2, 4 ou 8 octets. Les
+identifiants en \code{BIGINT} : on ne veut jamais tomber à court de numéros. \\
+\code{NUMERIC(p,s)} & montants, taux, PD & décimal exact : $p$ chiffres dont $s$ après la virgule.
+\code{NUMERIC(12,2)} va jusqu'à 9\,999\,999\,999,99. \\
+\code{REAL}, \code{DOUBLE PRECISION} & jamais pour l'argent & approximatifs : $0{,}1 + 0{,}2 \neq 0{,}3$. \\
+\code{VARCHAR(n)}, \code{TEXT} & noms, statuts, descriptions & \code{VARCHAR(n)} refuse plus de $n$
+caractères, \code{TEXT} n'a pas de limite. \\
+\code{CHAR(1)} & note de risque & longueur fixe. \\
+\code{BOOLEAN} & \code{defaut_anterieur}, \code{est_champion} & vrai, faux ou NULL. \\
+\code{DATE} & échéances, paiements & un jour, sans heure. \\
+\code{TIMESTAMP} & \code{date_prediction} & date et heure. En production, on préfère souvent
+\code{TIMESTAMPTZ}, qui tient compte du fuseau horaire. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+Les dates méritent une attention particulière, car tout le calcul du retard repose sur elles.
+
+\begin{itemize}
+\item \code{DATE - DATE} donne un \textbf{nombre entier de jours} :
+\code{DATE '2026-09-30' - DATE '2026-08-15'} vaut \textbf{46}. C'est le DPD du prêt 61.
+\item \code{DATE + entier} ajoute des jours ; \code{DATE + INTERVAL '1 month'} ajoute un mois et
+renvoie un \code{TIMESTAMP} (d'où les conversions \code{::date}).
+\end{itemize}
+
+\begin{piege}{Piège --- Ajouter des mois en chaîne}
+Que vaut le 31 janvier plus un mois ? PostgreSQL renvoie le \textbf{28 février} : il s'arrête au
+dernier jour du mois. Le problème apparaît si l'on enchaîne les ajouts :
+\begin{lstlisting}[style=sql]
+SELECT DATE '2026-01-31' + INTERVAL '1 month'                              AS plus_1_mois,   -- 2026-02-28
+       (DATE '2026-01-31' + INTERVAL '1 month') + INTERVAL '1 month'       AS chaine_2_mois, -- 2026-03-28
+       DATE '2026-01-31' + 2 * INTERVAL '1 month'                          AS direct_2_mois; -- 2026-03-31
+\end{lstlisting}
+En partant de chaque échéance pour calculer la suivante, toutes les échéances après février seraient
+décalées au 28. La bonne méthode : toujours partir de la \textbf{première} échéance et ajouter
+$(k-1)$ mois. C'est ce que fait le corrigé de l'exercice 1.1.
+\end{piege}
+
+\subsection{Les clés : identifier et relier}
+
+\begin{definition}{Clé primaire}
+Une colonne (ou un groupe de colonnes) qui identifie \textbf{chaque ligne de façon unique}. Elle est
+toujours \code{NOT NULL} et \code{UNIQUE}. Une table a une seule clé primaire.
+\end{definition}
+
+On distingue deux sortes de clés :
+\begin{itemize}
+\item une \textbf{clé naturelle} vient du métier : l'adresse e-mail d'un client, par exemple. Mais elle
+peut changer, et elle n'est pas toujours unique dans la durée ;
+\item une \textbf{clé artificielle} est un numéro sans signification, attribué par la base. C'est le
+choix du projet : \code{client_id}, \code{pret_id}, \code{echeance_id}. L'e-mail reste unique grâce à
+une contrainte \code{UNIQUE}.
+\end{itemize}
+
+La base attribue les numéros grâce aux colonnes \textbf{identité} :
+\begin{lstlisting}[style=sql]
+client_id   BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY  -- numéro automatique, ou fourni
+echeance_id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY      -- numéro toujours automatique
+\end{lstlisting}
+Avec \code{ALWAYS}, toute tentative d'insérer un numéro à la main est refusée. Avec \code{BY DEFAULT},
+on peut fournir le sien : c'est utile au chargement, pour garder le numéro de ligne du fichier source.
+L'ancienne syntaxe \code{SERIAL} fait la même chose, en moins strict.
+
+\begin{definition}{Clé étrangère}
+Une colonne dont chaque valeur doit exister comme clé primaire dans une autre table. Elle garantit
+l'\textbf{intégrité référentielle} : aucune échéance ne peut appartenir à un prêt qui n'existe pas.
+\end{definition}
+
+Que faire si l'on supprime la ligne référencée ? C'est l'option \code{ON DELETE} :
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}P{3.3cm} L P{4.3cm}@{}}
+\toprule
+\textbf{Option} & \textbf{Effet si l'on supprime un client qui a des prêts} & \textbf{Usage} \\
+\midrule
+\code{RESTRICT} / \code{NO ACTION} & la suppression est \textbf{refusée} & données à conserver : le choix bancaire \\
+\code{CASCADE} & les prêts sont supprimés aussi, puis leurs échéances\dots & données sans valeur propre \\
+\code{SET NULL} & le \code{client_id} des prêts devient NULL & lien facultatif \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{piege}{Piège --- La clé étrangère n'est pas indexée}
+PostgreSQL crée un index pour chaque clé primaire et chaque contrainte \code{UNIQUE}, mais
+\textbf{pas pour les clés étrangères}. Sans index sur \code{demandes_pret.client_id}, chaque jointure
+d'un client vers ses prêts relit toute la table des prêts, et chaque suppression d'un client doit
+parcourir toute la table pour vérifier qu'aucun prêt ne le référence. D'où \code{idx_prets_client}.
+\end{piege}
+
+Enfin, une contrainte \code{UNIQUE} peut porter sur \textbf{plusieurs colonnes} :
+\code{UNIQUE (pret_id, num_echeance)} interdit deux échéances numéro 5 pour le même prêt, tout en
+permettant l'échéance numéro 5 de chaque prêt.
+
+\subsection{NOT NULL et CHECK : les règles métier dans la base}
+
+\code{NOT NULL} interdit l'absence de valeur ; \code{DEFAULT} fournit une valeur quand on n'en donne
+pas. La contrainte \code{CHECK} accepte une ligne seulement si une condition est vraie :
+
+\begin{lstlisting}[style=sql]
+age        SMALLINT     NOT NULL CHECK (age BETWEEN 18 AND 100),
+note_risque CHAR(1)     NOT NULL CHECK (note_risque BETWEEN 'A' AND 'G'),
+motif_pret VARCHAR(25)  NOT NULL CHECK (motif_pret IN ('etudes', 'sante', 'creation_entreprise',
+                                                       'personnel', 'travaux', 'regroupement_dettes')),
+\end{lstlisting}
+
+Une contrainte peut porter sur \textbf{plusieurs colonnes de la même ligne}. On lui donne alors un nom,
+qui apparaîtra dans les messages d'erreur :
+\begin{lstlisting}[style=sql]
+CONSTRAINT paiement_borne         CHECK (montant_paye <= montant_du),
+CONSTRAINT decision_apres_demande CHECK (date_decision >= date_demande)
+\end{lstlisting}
+
+\subsubsection{Deux astuces logiques à connaître}
+
+\textbf{L'équivalence : comparer deux conditions.} En SQL, une condition est une valeur booléenne. On
+peut donc écrire \code{(A) = (B)} pour dire « A si et seulement si B ». Exemple : un prêt a un statut
+de remboursement \emph{si et seulement si} il est accordé.
+\begin{lstlisting}[style=sql]
+CONSTRAINT statut_si_accorde CHECK ((statut_dossier = 'accorde') = (statut_pret IS NOT NULL))
+\end{lstlisting}
+
+\begin{center}\small
+\begin{tabular}{@{}llccc@{}}
+\toprule
+\code{statut_dossier} & \code{statut_pret} & accordé ? & statut renseigné ? & Ligne acceptée ? \\
+\midrule
+accorde & sain & vrai & vrai & \ok{} oui \\
+refuse & NULL & faux & faux & \ok{} oui \\
+accorde & NULL & vrai & faux & \textcolor{rouge}{non} \\
+refuse & sain & faux & vrai & \textcolor{rouge}{non} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+La même astuce relie une décision à la PD et au seuil :
+\code{(decision = 'refuser') = (probabilite_defaut >= seuil_decision)}.
+
+\textbf{L'implication : « si A alors B ».} Elle s'écrit \code{NOT A OR B}. Par exemple, « si l'ancienneté
+est connue, elle ne dépasse pas l'âge moins 14 ans » :
+\begin{lstlisting}[style=sql]
+CONSTRAINT anciennete_coherente CHECK (anciennete_emploi IS NULL OR anciennete_emploi <= age - 14)
+\end{lstlisting}
+
+\begin{piege}{Piège --- Un CHECK laisse passer NULL}
+Une contrainte \code{CHECK} refuse une ligne seulement si la condition est \textbf{fausse}. Si elle
+vaut \textbf{NULL} (inconnue), la ligne est acceptée. Or toute comparaison avec NULL donne NULL :
+\code{SELECT NULL::int > 0} renvoie NULL, pas faux. Donc \code{CHECK (montant > 0)} accepte un montant
+NULL ! Pour l'interdire, il faut ajouter \code{NOT NULL}. C'est voulu pour \code{date_decision} (un
+dossier en attente n'a pas encore de décision), pas pour un montant.
+\end{piege}
+
+\begin{observation}[Ce qu'un CHECK ne peut pas faire]
+Un \code{CHECK} ne voit que la ligne en cours. Il ne peut pas vérifier une règle qui porte sur
+\textbf{plusieurs lignes} : « la somme des parts de capital d'un prêt égale le montant prêté », « un
+prêt a exactement autant d'échéances que de mois ». Pour ces règles, on écrit des requêtes de contrôle
+(exercice 1.4) ou des triggers (chapitre 3).
+\end{observation}
+
+\subsection{Les transactions : tout ou rien}
+
+\begin{imagine}
+Tu fais un virement de 500~€ de ton compte vers celui d'un ami. La banque doit faire deux opérations :
+retirer 500~€ de ton compte, ajouter 500~€ au sien. Si le serveur tombe en panne entre les deux,
+l'argent a disparu. Inacceptable : soit les deux opérations ont lieu, soit aucune.
+\end{imagine}
+
+\begin{definition}{Transaction et propriétés ACID}
+Une transaction est un groupe d'instructions qui forment un tout. PostgreSQL garantit quatre
+propriétés :
+\begin{itemize}
+\item \textbf{Atomicité} : tout est appliqué, ou rien ;
+\item \textbf{Cohérence} : la base passe d'un état valide à un état valide (toutes les contraintes sont
+respectées) ;
+\item \textbf{Isolation} : les transactions simultanées ne voient pas le travail inachevé des autres ;
+\item \textbf{Durabilité} : une fois validée, une transaction survit à une panne.
+\end{itemize}
+\end{definition}
+
+\begin{lstlisting}[style=sql]
+BEGIN;                -- début de la transaction
+INSERT INTO ...;      -- plusieurs instructions
+UPDATE ...;
+COMMIT;               -- tout est validé d'un coup (ou ROLLBACK : tout est annulé)
+\end{lstlisting}
+
+Sans \code{BEGIN}, chaque instruction est sa propre transaction (mode \emph{autocommit}, celui de psql
+et de DBeaver par défaut). Deux usages reviendront tout au long du cours :
+\begin{itemize}
+\item \textbf{créer des données liées} (un client, son prêt, ses échéances) : si une étape échoue, rien
+n'est enregistré ;
+\item \textbf{tester sans risque} : \code{BEGIN; ... ; ROLLBACK;} exécute un scénario puis annule tout.
+\end{itemize}
+
+\begin{piege}{Piège --- La transaction « interrompue »}
+Si une instruction échoue au milieu d'une transaction, PostgreSQL refuse toutes les suivantes avec
+le message \emph{current transaction is aborted, commands ignored until end of transaction block}. Il
+faut faire \code{ROLLBACK} pour repartir. Dans DBeaver, vérifie aussi le mode de validation (bouton
+\emph{Auto-Commit} de la barre d'outils) : en mode manuel, une transaction oubliée garde des verrous et
+bloque les autres utilisateurs.
+\end{piege}
+
+\subsection{Insérer des données liées : les CTE qui modifient}
+
+Pour créer un prêt, il faut connaître le \code{client_id} que la base vient d'attribuer. La clause
+\code{RETURNING} renvoie les lignes insérées, et une \textbf{CTE} (\code{WITH}, détaillée au chapitre 2)
+permet de les réutiliser dans l'instruction suivante :
+
+\begin{lstlisting}[style=sql]
+WITH nouveau_client AS (
+    INSERT INTO clients (...) VALUES (...)
+    RETURNING client_id                      -- le numéro attribué par la base
+)
+INSERT INTO demandes_pret (client_id, ...)
+SELECT client_id, ... FROM nouveau_client;   -- on le réutilise sans le connaître à l'avance
+\end{lstlisting}
+
+Deux règles à connaître : une CTE qui modifie des données \textbf{s'exécute toujours}, même si personne
+ne lit son résultat ; et toutes les parties de l'instruction voient la base \textbf{telle qu'elle était
+au début}. Une CTE ne voit pas les lignes insérées par une autre CTE, sauf à travers son
+\code{RETURNING}.
+
+\subsection{Le tableau d'amortissement : la dérivation complète}
+
+\begin{situation}{Hands-on --- La mensualité d'Awa}
+Awa emprunte $C = 12\,000$~€ sur $n = 36$ mois au taux annuel de 9,5~\%. Elle veut payer \textbf{la même
+somme chaque mois}. Quelle est cette mensualité $M$ ?
+\end{situation}
+
+\textbf{L'intuition.} Chaque mois, la banque facture des intérêts sur ce qui reste dû : le
+\textbf{capital restant dû} (CRD) multiplié par le taux mensuel $r$. La mensualité $M$ paie d'abord ces
+intérêts ; le reste rembourse le capital. Au début, le CRD est élevé, donc les intérêts aussi : la part
+de capital est petite. Puis le CRD baisse, les intérêts aussi, et la part de capital grandit
+(figure~\ref{fig:amortissement}).
+
+\textbf{La dérivation.} Le taux mensuel est $r = \dfrac{\text{taux annuel}}{12 \times 100}$. Notons
+$CRD_k$ le capital restant dû après $k$ mensualités.
+\begin{enumerate}
+\item Au départ, $CRD_0 = C$.
+\item Chaque mois, le CRD produit des intérêts puis la mensualité est payée :
+\[ CRD_k = CRD_{k-1}\,(1+r) - M \]
+\item En déroulant cette relation $k$ fois, on obtient une somme géométrique :
+\[ CRD_k = C(1+r)^k - M\left[(1+r)^{k-1} + \dots + (1+r) + 1\right]
+         = C(1+r)^k - M\,\frac{(1+r)^k - 1}{r} \]
+\item Le prêt est remboursé après $n$ mois : $CRD_n = 0$. On isole $M$ :
+\[ M\,\frac{(1+r)^n - 1}{r} = C(1+r)^n \quad\Longrightarrow\quad
+   \boxed{\;M = \frac{C \, r}{1 - (1+r)^{-n}}\;} \]
+\end{enumerate}
+
+\begin{calcul}{la mensualité d'Awa}
+\begin{enumerate}
+\item Taux mensuel : $r = 9{,}5 / 1200 = 0{,}0079167$.
+\item $(1+r)^{36} = 1{,}328271$, donc $(1+r)^{-36} = 0{,}752859$ et $1 - (1+r)^{-36} = 0{,}247141$.
+\item $C \times r = 12\,000 \times 0{,}0079167 = 95{,}00$.
+\item $M = 95{,}00 / 0{,}247141 = 384{,}395$, arrondi au centime : $\mathbf{384{,}40~€}$.
+\end{enumerate}
+Premier mois : intérêts $= 12\,000 \times r = 95{,}00$~€, capital remboursé $= 384{,}40 - 95{,}00 =
+289{,}40$~€, nouveau CRD $= 11\,710{,}60$~€. Coût total du crédit : 1\,838,21~€.
+\end{calcul}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}
+\begin{axis}[ybar stacked, bar width=7pt, width=15cm, height=6.2cm, ymin=0, ymax=420,
+  xmin=0, xmax=37, xlabel={Numéro de la mensualité}, ylabel={Euros},
+  legend style={at={(0.5,1.03)}, anchor=south, legend columns=2, draw=none, font=\small},
+  xtick={1,6,12,18,24,30,36}, tick label style={font=\footnotesize}, label style={font=\small},
+  grid=major, grid style={gray!20}, axis lines*=left]
+\addplot[fill=bleuML!75, draw=none] coordinates {
+(1,289.40) (2,291.69) (3,294.00) (4,296.33) (5,298.67) (6,301.04) (7,303.42) (8,305.83) (9,308.24)
+(10,310.69) (11,313.14) (12,315.62) (13,318.13) (14,320.64) (15,323.18) (16,325.73) (17,328.32)
+(18,330.92) (19,333.53) (20,336.18) (21,338.83) (22,341.52) (23,344.23) (24,346.95) (25,349.69)
+(26,352.46) (27,355.26) (28,358.06) (29,360.90) (30,363.76) (31,366.64) (32,369.54) (33,372.47)
+(34,375.41) (35,378.39) (36,381.19)};
+\addplot[fill=orangeEx!80, draw=none] coordinates {
+(1,95.00) (2,92.71) (3,90.40) (4,88.07) (5,85.73) (6,83.36) (7,80.98) (8,78.57) (9,76.16) (10,73.71)
+(11,71.26) (12,68.78) (13,66.27) (14,63.76) (15,61.22) (16,58.67) (17,56.08) (18,53.48) (19,50.87)
+(20,48.22) (21,45.57) (22,42.88) (23,40.17) (24,37.45) (25,34.71) (26,31.94) (27,29.14) (28,26.34)
+(29,23.50) (30,20.64) (31,17.76) (32,14.86) (33,11.93) (34,8.99) (35,6.01) (36,3.02)};
+\legend{Part de capital, Part d'intérêts}
+\end{axis}
+\end{tikzpicture}
+\caption{Le tableau d'amortissement d'Awa, tel que ta base le génère : la mensualité reste à
+384,40~€, mais sa composition change. La dernière (384,21~€) solde exactement le capital restant.}
+\label{fig:amortissement}
+\end{figure}
+
+\begin{piege}{Piège --- Les arrondis au centime}
+La mensualité est arrondie au centime (384,40 au lieu de 384,395\dots). Si l'on arrondit ensuite
+\emph{chaque} colonne indépendamment (intérêts, capital, CRD), le CRD d'un mois ne vaut plus exactement
+le CRD du mois précédent moins la part de capital : des écarts d'un centime apparaissent. La bonne
+méthode : arrondir les CRD, puis définir la part de capital comme la \textbf{différence} de deux CRD
+arrondis, et ajuster la dernière mensualité pour solder exactement le prêt. Les contrôles de
+l'exercice 1.4 vérifient tout cela.
+\end{piege}
+
+\subsection{Générer des lignes : generate\_series}
+
+Comment produire 36 lignes à partir d'un seul prêt ? La fonction \code{generate_series(a, b)} renvoie
+une table d'entiers de $a$ à $b$ :
+\begin{lstlisting}[style=sql]
+SELECT p.pret_id, k AS num_echeance,
+       (p.date_premiere_echeance + (k - 1) * INTERVAL '1 month')::date AS date_echeance
+FROM demandes_pret p
+CROSS JOIN generate_series(1, p.duree_mois) AS k     -- k = 1, 2, ..., duree_mois
+WHERE p.pret_id = 32582;
+\end{lstlisting}
+Le \code{CROSS JOIN} associe chaque prêt à chaque valeur de $k$ : un prêt de 36 mois produit 36 lignes.
+La fonction peut utiliser les colonnes du prêt (\code{p.duree_mois}) : PostgreSQL l'évalue pour chaque
+prêt.
+
+\subsection{Les index B-Tree : retrouver une ligne parmi un million}
+
+\begin{analogie}{l'annuaire téléphonique}
+Pour trouver le numéro de « Koné » dans un annuaire, tu ne lis pas toutes les pages : tu l'ouvres au
+milieu, tu vois que tu es à « M », tu reviens en arrière, et en quelques gestes tu es à la bonne page.
+C'est possible parce que l'annuaire est \textbf{trié}. Un index est un annuaire de la table : une copie
+triée d'une ou plusieurs colonnes, avec pour chaque valeur l'adresse de la ligne.
+\end{analogie}
+
+L'index B-Tree (\emph{balanced tree}, l'index par défaut de PostgreSQL) range les valeurs dans un arbre
+équilibré. Chaque nœud contient des centaines de valeurs : trois ou quatre niveaux suffisent pour
+plus d'un million de lignes (figure~\ref{fig:btree}).
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >=Stealth,
+  noeud/.style={draw=grisTexte, fill=white, minimum height=0.6cm, inner sep=3pt},
+  chemin/.style={draw=bleuML, fill=bleuFond, line width=0.9pt}]
+  \node[noeud, chemin] (r) at (0,0) {racine : \;\dots\; | 8\,200 | 16\,400 | 24\,600 | \dots};
+  \node[noeud, chemin] (i1) at (-4.2,-1.5) {\dots\; | 40 | 82 | 125 | \dots};
+  \node[noeud] (i2) at (0,-1.5) {\dots\; | 8\,240 | 8\,281 | \dots};
+  \node[noeud] (i3) at (4.2,-1.5) {\dots\; | 16\,440 | 16\,481 | \dots};
+  \node[noeud] (f0) at (-6.3,-3.1) {38 | 39 | 40};
+  \node[noeud, chemin] (f1) at (-3.6,-3.1) {\textbf{61} (18 août) | 61 (15 oct.) | \dots};
+  \node[noeud] (f2) at (-0.5,-3.1) {82 | 83 | \dots};
+  \node[draw=grisTitre, dashed, minimum width=3.3cm, minimum height=0.7cm, align=center] (t) at (2.7,-3.1)
+     {table : ligne de l'échéance};
+  \draw[->, chemin] (r) -- (i1);
+  \draw[->, grisTexte] (r) -- (i2);
+  \draw[->, grisTexte] (r) -- (i3);
+  \draw[->, grisTexte] (i1) -- (f0);
+  \draw[->, chemin] (i1) -- (f1);
+  \draw[->, grisTexte] (i1) -- (f2);
+  \draw[->, chemin, dashed] (f1.south) to[bend right=18] node[below, font=\scriptsize] {adresse de la ligne} (t.south);
+\end{tikzpicture}
+\caption{Recherche de l'impayé le plus ancien du prêt 61 dans l'index partiel
+\code{idx_echeances_impayees (pret_id, date_echeance)} : trois nœuds lus au lieu de 1,1 million de lignes.}
+\label{fig:btree}
+\end{figure}
+
+\subsubsection{Ce que ça change, mesuré sur ta base}
+
+La commande \code{EXPLAIN ANALYZE} exécute une requête et affiche le \textbf{plan} choisi par
+PostgreSQL avec les temps réels. Voici le calcul du retard du prêt 61 :
+
+\begin{lstlisting}[style=sql]
+EXPLAIN ANALYZE
+SELECT coalesce(DATE '2026-09-30' - min(date_echeance), 0)
+FROM echeancier_remboursements
+WHERE pret_id = 61 AND date_echeance <= DATE '2026-09-30' AND montant_paye < montant_du;
+\end{lstlisting}
+
+\textbf{Avec l'index partiel} : PostgreSQL descend l'arbre et lit une seule entrée.
+\begin{lstlisting}[style=sortie]
+->  Index Only Scan using idx_echeances_impayees on echeancier_remboursements
+      Index Cond: ((pret_id = 61) AND (date_echeance <= '2026-09-30'::date))
+Execution Time: 0.318 ms
+\end{lstlisting}
+
+\textbf{Sans index} (supprimés le temps du test, dans une transaction annulée) : PostgreSQL lit toute
+la table, en parallèle sur trois processus.
+\begin{lstlisting}[style=sortie]
+->  Parallel Seq Scan on echeancier_remboursements
+      Filter: ((date_echeance <= '2026-09-30'::date) AND (montant_paye < montant_du) AND (pret_id = 61))
+      Rows Removed by Filter: 369324
+Execution Time: 113.944 ms
+\end{lstlisting}
+
+Soit un facteur \textbf{350}. Pour un prêt, 114~ms paraissent acceptables. Mais au chapitre 3, une
+fonction calculera le retard des 32\,410 prêts un par un : avec l'index, 0,25 seconde ; sans index,
+plus de 20 minutes.
+
+\subsubsection{Les règles à connaître}
+
+\begin{itemize}
+\item \textbf{Index composite et préfixe gauche.} L'index \code{(pret_id, date_echeance)} est trié par
+prêt, puis par date à l'intérieur de chaque prêt, comme un annuaire trié par nom puis prénom. Il sert
+pour \code{WHERE pret_id = 61} et pour \code{WHERE pret_id = 61 AND date_echeance <= ...}, mais
+\textbf{pas} pour \code{WHERE date_echeance <= ...} seul.
+\item \textbf{Index partiel.} \code{WHERE montant_paye < montant_du} n'indexe que les échéances non
+soldées : 13~Mo au lieu de 33~Mo pour un index complet, et il reste à jour automatiquement (une échéance
+payée en sort d'elle-même).
+\item \textbf{Un index a un coût.} Chaque \code{INSERT} ou \code{UPDATE} doit aussi mettre à jour les
+index, et ils occupent de la place. On n'indexe que les colonnes réellement utilisées pour filtrer ou
+joindre.
+\item \textbf{\code{ANALYZE}} met à jour les statistiques que PostgreSQL utilise pour choisir son plan :
+à lancer après un gros chargement (le chargeur le fait).
+\end{itemize}
+
+\begin{piege}{Piège --- Une fonction sur la colonne indexée}
+\code{WHERE date_trunc('month', date_echeance) = DATE '2026-09-01'} ne peut pas utiliser un index sur
+\code{date_echeance} : l'index est trié sur la date, pas sur le résultat de la fonction. Écris plutôt
+un intervalle : \code{WHERE date_echeance >= DATE '2026-09-01' AND date_echeance < DATE '2026-10-01'}.
+\end{piege}
+
+% =============================================================================
+\section{Exercices guidés}
+
+\begin{exercice}{1.1}{Ouvrir un nouveau dossier de prêt complet, en une transaction}
+Crée le dossier d'Awa Koné, en \textbf{une seule transaction} :
+\begin{enumerate}
+\item la cliente : Awa Koné, \code{awa.kone@exemple.fr}, 29 ans, 42\,000~€ de revenu, locataire,
+4 ans d'ancienneté dans l'emploi, 6 ans d'historique de crédit, aucun défaut antérieur, inscrite le
+15/09/2026 ;
+\item son prêt : 12\,000~€ sur 36 mois à 9,5~\%, motif études, note B, demandé le 20/09/2026, accordé
+le 25/09/2026, première échéance le 25/10/2026, statut « sain » ;
+\item la prédiction du modèle champion \code{xgboost_monotone_v2} qui a justifié la décision : PD
+0,118, seuil 0,255, décision « accorder », variable SHAP principale \code{taux_effort} (0,912), calculée
+le 24/09/2026 à 14~h~30 ;
+\item ses 36 échéances, à mensualité constante.
+\end{enumerate}
+Aucun identifiant ne doit être écrit en dur : utilise ceux que la base attribue. Vérifie ensuite le
+nombre d'échéances, le capital total remboursé et le coût du crédit.
+\end{exercice}
+
+\begin{correction}{1.1}
+\textbf{Étape 1 --- Ouvrir la transaction.} \code{BEGIN} : si une seule des quatre insertions échoue,
+aucune ne sera enregistrée.
+
+\textbf{Étape 2 --- La cliente.} Une CTE insère la cliente et renvoie son \code{client_id}.
+
+\textbf{Étape 3 --- Le prêt.} La CTE suivante lit ce \code{client_id} dans \code{nouveau_client}. Son
+\code{RETURNING} renvoie tout ce dont l'échéancier aura besoin, sous des noms courts : le capital $c$,
+la durée $n$, le taux mensuel $r$ et la date de première échéance.
+
+\textbf{Étape 4 --- La prédiction.} Une CTE insère le score. Personne ne la lit ensuite : elle
+s'exécute quand même.
+
+\textbf{Étape 5 --- Les mensualités.} \code{generate_series(1, n)} produit les 36 numéros ; la mensualité
+est calculée par la formule d'annuité et arrondie au centime ; chaque date part de la première
+échéance (voir le piège des mois).
+
+\textbf{Étape 6 --- Le capital restant dû.} Pour chaque $k$, on calcule $CRD_{k-1}$ et $CRD_k$ par la
+formule fermée, arrondis au centime.
+
+\textbf{Étape 7 --- L'insertion.} Pour les 35 premières échéances : montant $= M$, capital
+$= CRD_{k-1} - CRD_k$, intérêts $= M -$ capital. La dernière solde exactement le capital restant :
+capital $= CRD_{35}$, intérêts $= CRD_{35} \times r$.
+
+\begin{lstlisting}[style=long]
+BEGIN;
+
+WITH nouveau_client AS (
+    INSERT INTO clients (nom_complet, email, age, revenu_annuel, statut_logement,
+                         anciennete_emploi, anciennete_credit, defaut_anterieur, date_inscription)
+    VALUES ('Awa Koné', 'awa.kone@exemple.fr', 29, 42000, 'locataire', 4, 6, false, DATE '2026-09-15')
+    RETURNING client_id
+),
+nouveau_pret AS (
+    INSERT INTO demandes_pret (client_id, montant_demande, duree_mois, taux_interet, motif_pret, note_risque,
+                               date_demande, date_decision, date_premiere_echeance, statut_dossier, statut_pret)
+    SELECT client_id, 12000, 36, 9.5, 'etudes', 'B',
+           DATE '2026-09-20', DATE '2026-09-25', DATE '2026-10-25', 'accorde', 'sain'
+    FROM nouveau_client
+    RETURNING pret_id, montant_demande AS c, duree_mois AS n, taux_interet / 1200 AS r, date_premiere_echeance
+),
+-- Le score du modèle champion qui a justifié la décision (PD 11,8 % < seuil 25,5 % : accordé).
+-- Une CTE qui modifie des données s'exécute même si personne ne la lit ensuite.
+score AS (
+    INSERT INTO predictions_scoring_ml (pret_id, version_modele, est_champion, probabilite_defaut,
+                                        seuil_decision, decision, shap_top_feature, shap_top_valeur, date_prediction)
+    SELECT pret_id, 'xgboost_monotone_v2', true, 0.118, 0.255, 'accorder', 'taux_effort', 0.912,
+           TIMESTAMP '2026-09-24 14:30'
+    FROM nouveau_pret
+),
+-- Mensualité constante : M = C × r / (1 − (1 + r)^−n)
+mensualites AS (
+    SELECT p.pret_id, p.c, p.r, p.n, k AS num_echeance,
+           (p.date_premiere_echeance + (k - 1) * INTERVAL '1 month')::DATE AS date_echeance,
+           round(p.c * p.r / (1 - (1 + p.r) ^ (-p.n)), 2)                    AS mensualite
+    FROM nouveau_pret p
+    CROSS JOIN generate_series(1, p.n) AS k                   -- une ligne par mensualité
+),
+-- Capital restant dû après k mensualités : CRD(k) = C(1 + r)^k − M((1 + r)^k − 1) / r, arrondi au centime.
+-- La part de capital est la DIFFÉRENCE de deux CRD arrondis : le CRD baisse exactement de la part de capital.
+calcul AS (
+    SELECT pret_id, num_echeance, date_echeance, mensualite, r, n,
+           round(c * (1 + r) ^ (num_echeance - 1) - mensualite * ((1 + r) ^ (num_echeance - 1) - 1) / r, 2) AS crd_avant,
+           round(c * (1 + r) ^ num_echeance       - mensualite * ((1 + r) ^ num_echeance - 1) / r, 2)       AS crd_apres
+    FROM mensualites
+)
+INSERT INTO echeancier_remboursements (pret_id, num_echeance, date_echeance, montant_du,
+                                       part_capital, part_interets, capital_restant_du)
+SELECT pret_id, num_echeance, date_echeance,
+       -- la dernière échéance solde exactement le capital restant
+       CASE WHEN num_echeance = n THEN crd_avant + round(crd_avant * r, 2) ELSE mensualite END,
+       CASE WHEN num_echeance = n THEN crd_avant ELSE crd_avant - crd_apres END,
+       CASE WHEN num_echeance = n THEN round(crd_avant * r, 2) ELSE mensualite - (crd_avant - crd_apres) END,
+       CASE WHEN num_echeance = n THEN 0 ELSE crd_apres END
+FROM calcul;
+
+COMMIT;
+\end{lstlisting}
+
+\textbf{Étape 8 --- Vérifier.} On retrouve le prêt par l'e-mail de la cliente, sans connaître son
+numéro. \code{FILTER} (vu au chapitre 2) isole une échéance dans un agrégat.
+
+\begin{lstlisting}[style=long]
+SELECT p.pret_id, count(*) AS nb_echeances, sum(e.part_capital) AS capital_rembourse,
+       sum(e.part_interets) AS cout_du_credit,
+       max(e.montant_du) FILTER (WHERE e.num_echeance = 1) AS mensualite,
+       max(e.montant_du) FILTER (WHERE e.num_echeance = p.duree_mois) AS derniere_echeance
+FROM demandes_pret p JOIN echeancier_remboursements e USING (pret_id)
+WHERE p.client_id = (SELECT client_id FROM clients WHERE email = 'awa.kone@exemple.fr')
+GROUP BY p.pret_id;
+\end{lstlisting}
+
+\begin{center}\small
+\begin{tabular}{@{}rrrrrr@{}}
+\toprule
+\code{pret_id} & \code{nb_echeances} & \code{capital_rembourse} & \code{cout_du_credit} & \code{mensualite} & \code{derniere_echeance} \\
+\midrule
+32582 & 36 & 12\,000,00 & 1\,838,21 & 384,40 & 384,21 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\textbf{À retenir.} Les identifiants circulent par \code{RETURNING} au lieu d'être écrits en dur ; la
+transaction garantit le « tout ou rien » ; l'échéancier est calculé en une seule requête ensembliste,
+sans boucle.
+\end{correction}
+
+\begin{exercice}{1.2}{Les contraintes refusent les données incohérentes}
+Écris quatre instructions qui violent chacune une règle, exécute-les \textbf{une par une} et lis le
+message d'erreur :
+\begin{enumerate}[label=\alph*)]
+\item créer un client de 15 ans ;
+\item enregistrer sur une échéance future impayée un paiement supérieur au montant dû ;
+\item supprimer le client 2, qui a un prêt ;
+\item créer un prêt refusé dont le statut de remboursement est « sain ».
+\end{enumerate}
+\end{exercice}
+
+\begin{correction}{1.2}
+\begin{lstlisting}[style=long]
+-- a) Un client de 15 ans
+INSERT INTO clients (nom_complet, email, age, revenu_annuel, statut_logement, anciennete_credit,
+                     defaut_anterieur, date_inscription)
+VALUES ('Test', 'test@exemple.fr', 15, 20000, 'locataire', 0, false, CURRENT_DATE);
+
+-- b) Payer plus que le montant dû, sur une échéance future encore impayée
+UPDATE echeancier_remboursements SET montant_paye = montant_du + 1
+WHERE echeance_id = (SELECT min(echeance_id) FROM echeancier_remboursements
+                     WHERE montant_paye = 0 AND date_echeance > DATE '2026-09-30');
+
+-- c) Supprimer un client qui a des prêts
+DELETE FROM clients WHERE client_id = 2;
+
+-- d) Un prêt refusé avec un statut de remboursement
+INSERT INTO demandes_pret (client_id, montant_demande, duree_mois, taux_interet, motif_pret, note_risque,
+                           date_demande, statut_dossier, statut_pret)
+VALUES (2, 1000, 12, 10, 'etudes', 'A', DATE '2026-09-01', 'refuse', 'sain');
+\end{lstlisting}
+
+Les quatre messages obtenus :
+\begin{lstlisting}[style=sortie]
+a) ERROR: new row for relation "clients" violates check constraint "clients_age_check"
+b) ERROR: new row for relation "echeancier_remboursements" violates check constraint "paiement_borne"
+c) ERROR: update or delete on table "clients" violates foreign key constraint
+          "demandes_pret_client_id_fkey" on table "demandes_pret"
+   DETAIL: Key (client_id)=(2) is still referenced from table "demandes_pret".
+d) ERROR: new row for relation "demandes_pret" violates check constraint "statut_si_accorde"
+\end{lstlisting}
+
+\textbf{Lecture des messages.} En a), la contrainte n'a pas de nom explicite : PostgreSQL l'a nommée
+\code{clients_age_check}. En b), d) le nom choisi dans le schéma rend l'erreur immédiatement
+compréhensible : c'est l'intérêt de nommer ses contraintes.
+
+\textbf{Pourquoi une échéance future en b) ?} Sur une échéance déjà payée, le nouveau montant violerait
+\emph{deux} contraintes : \code{paiement_borne}, mais aussi \code{date_si_solde} (une date de paiement
+alors que le montant payé ne vaut plus le montant dû). PostgreSQL signale alors la première qu'il
+vérifie, \code{date_si_solde}, ce qui brouille la démonstration.
+
+\textbf{Pourquoi la base, et pas l'application ?} Une application peut avoir un bug, un analyste peut
+écrire une requête directement, un script de reprise peut contourner l'interface. La contrainte en
+base protège \textbf{tous} les chemins d'accès.
+\end{correction}
+
+% =============================================================================
+\section{Exercices à faire seul}
+
+\begin{exercice}{1.3}{Les deux tables du chapitre 3}
+Le chapitre 3 a besoin de deux nouvelles tables. Écris leur \code{CREATE TABLE}, avec les types et
+toutes les contraintes qui te paraissent nécessaires.
+
+\textbf{1. \code{journal_statuts}} --- le journal d'audit des changements de statut d'un prêt. Chaque
+ligne enregistre : un identifiant automatique ; le prêt concerné ; l'ancien statut (qui peut être
+absent) et le nouveau (obligatoire) ; le nombre de jours de retard au moment du changement (jamais
+négatif) ; la date d'effet ; l'horodatage de l'enregistrement (par défaut, l'instant présent) ;
+l'utilisateur qui a fait le changement (par défaut, l'utilisateur connecté). Une ligne n'a de sens que
+si le statut a réellement changé. Pense à l'index utile.
+
+\textbf{2. \code{provisions_mensuelles}} --- une « photographie » du risque de chaque prêt à chaque
+date d'arrêté : le retard, le stage IFRS~9 (1, 2 ou 3), l'EAD, la PD utilisée, la LGD et l'ECL. Un prêt
+ne peut avoir qu'\textbf{une ligne par arrêté}.
+\end{exercice}
+
+\begin{indice}
+\begin{itemize}
+\item « Ancien différent de nouveau » : que donne \code{NULL <> 'sain'} ? Cherche l'opérateur
+\code{IS DISTINCT FROM}.
+\item L'utilisateur connecté s'obtient avec \code{session_user} ; l'instant présent avec \code{now()}.
+\item « Une ligne par prêt et par arrêté » : une clé primaire peut porter sur deux colonnes.
+\item Les clés étrangères : quelle option \code{ON DELETE} pour un journal d'audit ?
+\end{itemize}
+\end{indice}
+
+\begin{exercice}{1.4}{Contrôles qualité de l'échéancier}
+Les contraintes vérifient chaque \emph{ligne}. Certaines règles portent sur un prêt \emph{entier} ou sur
+deux échéances successives : il faut les contrôler par des requêtes. Écris des requêtes qui comptent les
+anomalies suivantes (le résultat attendu est 0 partout) :
+\begin{enumerate}[label=\alph*)]
+\item par prêt accordé : la somme des parts de capital diffère du montant prêté ; le nombre
+d'échéances ou le dernier numéro diffère de la durée ; le CRD de la dernière échéance n'est pas nul ;
+une échéance a un montant dû différent de capital + intérêts ;
+\item entre deux échéances successives d'un même prêt : le CRD ne baisse pas exactement de la part
+de capital ; l'écart entre les deux dates n'est pas compris entre 28 et 31 jours ;
+\item un paiement est daté d'avant l'octroi du prêt.
+\end{enumerate}
+\end{exercice}
+
+\begin{indice}
+\begin{itemize}
+\item a) Un \code{GROUP BY p.pret_id} sur la jointure prêts--échéances, puis compter les prêts en
+anomalie. \code{count(*) FILTER (WHERE condition)} compte les lignes qui vérifient la condition (vu au
+chapitre 2) ; \code{sum(CASE WHEN condition THEN 1 ELSE 0 END)} fait la même chose.
+\item b) Joins la table à elle-même (\textbf{auto-jointure}) : l'échéance \code{prec} et l'échéance
+\code{suiv} du même prêt, avec \code{suiv.num_echeance = prec.num_echeance + 1}.
+\item Si tu trouves des écarts d'un centime, relis le piège des arrondis.
+\end{itemize}
+\end{indice}
+
+% =============================================================================
+\section{Synthèse pour les entretiens}
+
+\begin{resume}
+\begin{enumerate}
+\item \textbf{Normaliser} : chaque fait stocké une seule fois. Les tables d'analyse pour le ML peuvent
+être dénormalisées, pas le système source.
+\item \textbf{Types} : \code{NUMERIC} pour l'argent ; \code{DATE - DATE} donne des jours ; toujours
+ajouter des mois à partir de la première échéance.
+\item \textbf{Clés} : primaire (unique et non nulle), étrangère (intégrité référentielle, \code{RESTRICT}
+en banque), \code{UNIQUE} composite. Les clés étrangères ne sont pas indexées automatiquement.
+\item \textbf{CHECK} : règles sur une ligne ; équivalence \code{(A) = (B)}, implication \code{NOT A OR B} ;
+un CHECK laisse passer NULL.
+\item \textbf{Transactions} : ACID, tout ou rien ; \code{BEGIN ... ROLLBACK} pour tester sans risque.
+\item \textbf{CTE et RETURNING} pour insérer des données liées sans écrire d'identifiant en dur.
+\item \textbf{Mensualité} : $M = C\,r / (1 - (1+r)^{-n})$ ; attention aux arrondis au centime.
+\item \textbf{Index B-Tree} : recherche en quelques nœuds ; préfixe gauche ; index partiel ; mesuré :
+0,3~ms contre 114~ms.
+\end{enumerate}
+\end{resume}
+
+\begin{entretien}
+\begin{itemize}
+\item « J'ai conçu un schéma normalisé de six tables, plus deux tables d'audit et de provisions. Les
+règles métier sont dans la base : des contraintes \code{CHECK} nommées, y compris entre colonnes, comme
+l'équivalence entre une décision de refus et une PD au-dessus du seuil. »
+\item « J'utilise \code{NUMERIC} pour les montants, parce qu'un \code{FLOAT} ne représente pas
+exactement 0,10 et que les totaux comptables doivent tomber juste au centime. »
+\item « Toutes les clés étrangères sont en \code{ON DELETE RESTRICT} : supprimer un client ne doit
+jamais effacer l'historique de ses prêts. Et je les indexe, car PostgreSQL ne le fait pas. »
+\item « Le calcul du retard utilise un index partiel sur les seules échéances impayées : 13~Mo au lieu
+de 33, et une requête en 0,3~ms au lieu de 114. »
+\end{itemize}
+\end{entretien}
+
+\subsection*{Questions fréquentes en entretien}
+
+\begin{description}[leftmargin=0pt, itemsep=0.5em]
+\item[Clé primaire ou contrainte UNIQUE ?] Une table a une seule clé primaire, jamais NULL ; elle peut
+avoir plusieurs contraintes \code{UNIQUE}, qui acceptent les NULL (plusieurs NULL ne sont pas
+considérés comme égaux).
+\item[DELETE, TRUNCATE ou DROP ?] \code{DELETE} supprime des lignes (avec un \code{WHERE}, ligne à
+ligne, triggers déclenchés) ; \code{TRUNCATE} vide toute la table d'un coup, très vite ; \code{DROP}
+supprime la table elle-même.
+\item[Pourquoi ne pas tout mettre en CASCADE ?] Parce qu'une seule suppression pourrait effacer en
+chaîne des milliers de lignes d'historique, sans avertissement.
+\item[Quand un index ralentit-il ?] Il ralentit les écritures (chaque insertion met à jour chaque
+index) et devient inutile si la requête lit une grande partie de la table.
+\item[Qu'est-ce qu'une transaction ?] Un groupe d'instructions atomique : tout ou rien. Avec les
+propriétés ACID.
+\end{description}

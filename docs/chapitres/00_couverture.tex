@@ -1,0 +1,193 @@
+% =============================================================================
+% Couverture, avant-propos, sommaire
+% =============================================================================
+\begin{titlepage}
+\begin{tikzpicture}[remember picture, overlay]
+  \fill[bleuCouv] (current page.south west) rectangle (current page.north east);
+  \fill[bleuML] (current page.north west) rectangle ([yshift=-3.3cm]current page.north east);
+  \foreach \i in {0,...,8}
+    \fill[white, opacity=0.09] ([xshift=1.3cm+\i*1.65cm, yshift=-0.95cm]current page.north west) circle (0.78cm);
+  \node[white, font=\small] at ([yshift=-2.55cm]current page.north) {Année universitaire 2026--2027};
+  \fill[bleuML!80!black] ([yshift=-3.3cm]current page.north west) rectangle ([yshift=-3.42cm]current page.north east);
+  \fill[bleuML] (current page.south west) rectangle ([yshift=2.3cm]current page.south east);
+  \fill[bleuML!80!black] ([yshift=2.3cm]current page.south west) rectangle ([yshift=2.42cm]current page.south east);
+\end{tikzpicture}
+
+\vspace*{2.6cm}
+\begin{center}
+{\color{grisTitre}\rule{0.62\linewidth}{0.6pt}}\par\vspace{0.9cm}
+{\color{bleuML}\fontsize{27}{33}\selectfont Risk Analytics \&\\[2pt] Scoring de Crédit\par}
+\vspace{0.45cm}
+{\color{bleuML}\Large Un système backend SQL d'entreprise\par}
+\vspace{0.15cm}
+{\color{bleuML}\large PostgreSQL · Machine Learning · MLOps\par}
+\vspace{0.5cm}
+{\itshape\color{grisTexte} Cours complet sur un cas réel de 32\,409 prêts, exercices guidés\\
+et corrigés --- pour préparer tes entretiens de stage en Data Science / IA\par}
+\vspace{0.9cm}
+{\color{grisTitre}\rule{0.62\linewidth}{0.6pt}}\par\vspace{1.1cm}
+
+% Illustration : des données au pilotage du risque
+\begin{tikzpicture}[font=\small, >=Stealth]
+  \node[draw=grisTitre, fill=white, rounded corners=3pt, minimum width=2.6cm, minimum height=1.5cm,
+        align=center] (src) at (0,0) {\textbf{Données}\\[-1pt]{\footnotesize CSV, modèles R}\\[-1pt]{\footnotesize XGBoost, SHAP}};
+  \node[cylinder, shape border rotate=90, aspect=0.22, draw=bleuML, fill=bleuFond, minimum width=2.3cm,
+        minimum height=1.9cm, align=center, line width=0.8pt] (db) at (4.3,0) {\textbf{PostgreSQL}\\[-1pt]{\footnotesize 8 tables}\\[-1pt]{\footnotesize 1,6 M lignes}};
+  \node[draw=grisTitre, fill=white, rounded corners=3pt, minimum width=2.6cm, minimum height=1.5cm] (out) at (8.6,0) {};
+  \foreach \x/\h/\c in {-0.75/0.35/bleuML!35, -0.35/0.55/bleuML!50, 0.05/0.8/bleuML!70, 0.45/0.45/rouge!70}
+    \fill[\c] ([xshift=\x cm, yshift=-0.55cm]out.center) rectangle ++(0.3,\h);
+  \node[font=\footnotesize, anchor=north] at ([yshift=0.68cm]out.center) {\textbf{Risque piloté}};
+  \draw[->, line width=1pt, bleuML] (src) -- (db);
+  \draw[->, line width=1pt, bleuML] (db) -- (out);
+\end{tikzpicture}
+
+\vspace{1.5cm}
+\begin{tikzpicture}
+  \node[draw=bleuML, line width=1pt, rounded corners=6pt, fill=white, minimum width=6.2cm,
+        minimum height=1cm, align=center] {\large\textbf{Mohamed Fofana}\\[1pt]
+        {\small M1 Mathématiques Appliquées, Statistique --- Université Clermont Auvergne}};
+\end{tikzpicture}
+\end{center}
+\end{titlepage}
+
+% =============================================================================
+\chapter*{Avant-propos}
+\addcontentsline{toc}{chapter}{Avant-propos}
+\markboth{Avant-propos}{}
+
+Ce cours t'accompagne dans la construction d'\textbf{un seul projet SQL, de niveau entreprise} : le
+système de base de données qui, dans une banque, gère le risque de crédit. On y suit chaque prêt de
+sa demande jusqu'à son dernier remboursement ou jusqu'à son défaut, on y range les prédictions des
+modèles de Machine Learning, et on y calcule chaque mois l'argent que la banque doit mettre de côté
+pour couvrir ses pertes.
+
+Il a un double objectif. D'abord te faire \textbf{comprendre} : le métier du risque de crédit, les
+notions SQL avancées et la raison d'être de chaque choix technique. Ensuite te permettre de
+\textbf{tout coder toi-même}, de A à Z, avec une feuille de route précise et des résultats attendus
+pour vérifier ton travail à chaque étape.
+
+\section*{Philosophie pédagogique}
+
+Comme dans un cours de Machine Learning bien construit, chaque notion est présentée selon une
+progression en \textbf{cinq étapes} :
+\begin{enumerate}
+\item \textbf{Mise en situation d'abord} : un problème concret de l'équipe Risque, avant toute théorie.
+\item \textbf{Intuition et analogies} : l'idée expliquée avec des images de la vie quotidienne.
+\item \textbf{Notions détaillées} : la syntaxe, les règles, les formules dérivées pas à pas, et les
+\textbf{pièges} que les recruteurs adorent tester.
+\item \textbf{Exercices guidés sur ta base} : du vrai SQL, exécuté sur tes données, corrigé ligne à ligne.
+\item \textbf{Exercices à faire seul} : énoncés et indices dans le chapitre, corrigés à la fin du cours.
+\end{enumerate}
+Chaque chapitre se termine par une \textbf{synthèse pour les entretiens} : ce qu'il faut retenir et les
+phrases que tu pourras dire.
+
+\section*{Le fil rouge : ta base de données}
+
+Tout au long du cours, on travaille sur \textbf{la même base}, \code{risk_analytics_db}, construite à
+partir des données réelles de ton projet de scoring de crédit :
+\begin{itemize}
+\item \textbf{32\,409 prêts réels} (jeu de données \emph{Credit Risk Dataset}, après nettoyage), dont
+\textbf{7\,088 ont fait défaut} (21,9~\%) ;
+\item les \textbf{prédictions réelles de tes trois modèles} R : la grille de score, la régression
+logistique et le XGBoost monotone (le « champion »), avec l'explication SHAP de chaque décision ;
+\item \textbf{1\,107\,936 mensualités} et leurs paiements, simulés de façon cohérente avec le défaut
+réel : un prêt qui a fait défaut cesse de payer, un prêt sain rembourse.
+\end{itemize}
+
+Quatre personnages reviennent souvent, parce qu'ils illustrent chacun une situation typique :
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}l L@{}}
+\toprule
+\textbf{Awa Koné} (prêt 32582) & nouvelle cliente : 12\,000~€ sur 36 mois pour ses études. Tu créeras
+son dossier au chapitre~1. \\
+\textbf{Prêt 67} & 28\,000~€ de travaux, en retard de \textbf{3 jours} au 30/09/2026. \\
+\textbf{Prêt 61} & 30\,000~€ pour une création d'entreprise, en retard de \textbf{46 jours}. \\
+\textbf{Prêt 9} & 35\,000~€ de prêt personnel, \textbf{388 jours} de retard : il est en défaut. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{observation}[Une date de référence figée]
+Dans une vraie banque, « aujourd'hui » est la date du jour. Ici, la base contient un paramètre
+\code{date_reference} fixé au \textbf{30 septembre 2026}. Tes résultats seront donc exactement ceux
+de ce cours, quel que soit le jour où tu les calcules.
+\end{observation}
+
+\section*{Comment ce cours suit ton plan}
+
+Le cours reprend exactement le plan que tu as demandé :
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}l L@{}}
+\toprule
+\textbf{Partie 1} & Description du projet : titre, contexte et enjeux métier, cas d'usage. \\
+\textbf{Partie 2} & Problématique et objectifs : les quatre problèmes métier, les objectifs techniques. \\
+\textbf{Partie 3} & Architecture de la base : modèles conceptuel et relationnel, dictionnaire de
+données, index, code DDL complet. \\
+\textbf{Partie 4} & Modules de cours : \textbf{Chapitre 1} Modélisation, DDL et contraintes ;
+\textbf{Chapitre 2} SQL analytique avancé ; \textbf{Chapitre 3} Triggers et procédures stockées.
+Chacun avec cours, exercices guidés, exercices seuls et synthèse. \\
+\textbf{Partie 5} & Feuille de route : les tâches 1 à 6, à cocher au fur et à mesure. \\
+\textbf{À la fin} & Corrigés des exercices à faire seul, aide-mémoire SQL, glossaire métier et questions
+d'entretien. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section*{Le dossier du projet}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}l L@{}}
+\toprule
+\code{docs/} & ce cours (PDF et sources LaTeX). \\
+\code{donnees/} & les données sources : \code{credit_risk_dataset.csv} (les prêts),
+\code{predictions_modeles.csv} et \code{shap_xgboost.csv} (sorties de tes modèles R),
+\code{echantillon.csv} (découpage apprentissage / test). \\
+\code{sql/01_schema.sql} & le schéma de la base (fourni : c'est le code DDL de la partie~3). \\
+\code{sql/} & \textbf{ton dossier de travail} : tu y écris tes propres scripts, chapitre par chapitre. \\
+\code{python/charger_donnees.py} & le script d'alimentation (Faker, Pandas, SQLAlchemy), présenté à la tâche~3. \\
+\code{corriges/} & les corrigés complets des trois chapitres, exécutables tels quels. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\section*{Prérequis et méthode}
+
+\begin{itemize}
+\item \textbf{SQL de base} : \code{SELECT}, \code{WHERE}, \code{JOIN}, \code{GROUP BY}. Tout le reste
+est expliqué.
+\item \textbf{Python de base} et quelques notions de probabilités (une probabilité de défaut, une AUC) :
+tu les as déjà vues en master.
+\item \textbf{Tape le code toi-même}, ne le copie pas : c'est en écrivant qu'on retient. Cherche chaque
+exercice seul au moins 20 minutes avant d'ouvrir le corrigé.
+\item \textbf{Compare tes résultats} à ceux du cours. Un écart n'est pas un échec : c'est la meilleure
+occasion de comprendre quelque chose.
+\end{itemize}
+
+\section*{Les encadrés du cours}
+
+\begin{imagine}
+Une situation concrète pour entrer dans le sujet.
+\end{imagine}
+\vspace{-4pt}
+\begin{definition}{Notion}
+Une définition précise, à connaître par cœur.
+\end{definition}
+\vspace{-4pt}
+\begin{piege}{Piège}
+Une erreur fréquente, souvent testée en entretien.
+\end{piege}
+\vspace{-4pt}
+\begin{exercice}{1.1}{Titre}
+Un exercice : guidé (corrigé juste après) ou à faire seul (corrigé à la fin).
+\end{exercice}
+\vspace{-4pt}
+\begin{entretien}
+Les phrases à savoir dire à un recruteur.
+\end{entretien}
+
+\clearpage
+\tableofcontents
+\clearpage
+\renewcommand{\nomchapitre}{Partie}

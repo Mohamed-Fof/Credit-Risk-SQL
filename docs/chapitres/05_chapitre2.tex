@@ -1,0 +1,885 @@
+% =============================================================================
+% Chapitre 2 — SQL analytique avancé
+% =============================================================================
+\chapter{SQL analytique avancé : CTE et fonctions de fenêtre}
+
+\epigraphe{Les données ne parlent pas d'elles-mêmes : il faut savoir les interroger.}
+
+La base est construite et remplie. Il faut maintenant la faire parler : combien de prêts sont en
+retard, combien la banque doit provisionner, si le modèle classe toujours bien les clients, comment
+évoluent les encaissements. Ces questions demandent des outils plus puissants qu'un simple
+\code{GROUP BY} : les \textbf{CTE}, les \textbf{vues}, les \textbf{agrégats conditionnels} et surtout
+les \textbf{fonctions de fenêtre}, les notions SQL les plus testées en entretien data.
+
+\begin{observation}[Tes fichiers pour ce chapitre]
+\begin{itemize}
+\item Ton code : \code{sql/03_chapitre2.sql}. Le corrigé complet : \code{corriges/chapitre2.sql}.
+\item Prérequis : le chapitre 1 exécuté. « Aujourd'hui » est la date de référence de la base, le 30/09/2026.
+\end{itemize}
+\end{observation}
+
+\begin{situation}{Mise en situation --- Le comité des risques de 9 heures}
+Demain matin, le directeur des risques présente l'état du portefeuille au comité de direction. Il te
+demande quatre chiffres pour 9 heures :
+\begin{enumerate}
+\item la répartition des prêts par tranche de retard, et la part de l'encours à risque ;
+\item le montant des provisions IFRS~9, stage par stage ;
+\item la preuve que le modèle de scoring classe toujours correctement les clients ;
+\item l'évolution des encaissements sur les douze derniers mois.
+\end{enumerate}
+Il est 17 heures. Tu as une base, PostgreSQL et ce chapitre.
+\end{situation}
+
+% =============================================================================
+\section{Cours et notions importantes}
+
+\subsection{L'ordre d'exécution d'une requête}
+
+On écrit une requête dans l'ordre \code{SELECT ... FROM ... WHERE ...}, mais PostgreSQL l'exécute dans un
+autre ordre (figure~\ref{fig:ordre}). Le connaître explique la moitié des erreurs de débutant.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[font=\footnotesize, >=Stealth, node distance=0.25cm,
+  etape/.style={draw=grisTexte, fill=white, rounded corners=2pt, minimum height=0.8cm, align=center, inner sep=4pt},
+  fen/.style={etape, draw=bleuML, fill=bleuFond, line width=0.9pt}]
+  \node[etape] (a) {\textbf{1} FROM\\JOIN};
+  \node[etape, right=of a] (b) {\textbf{2}\\WHERE};
+  \node[etape, right=of b] (c) {\textbf{3} GROUP\\BY};
+  \node[etape, right=of c] (d) {\textbf{4}\\HAVING};
+  \node[fen, right=of d] (e) {\textbf{5} SELECT\\{\footnotesize + fenêtres}};
+  \node[etape, right=of e] (f) {\textbf{6}\\DISTINCT};
+  \node[etape, right=of f] (g) {\textbf{7} ORDER\\BY};
+  \node[etape, right=of g] (h) {\textbf{8}\\LIMIT};
+  \foreach \x/\y in {a/b,b/c,c/d,d/e,e/f,f/g,g/h} \draw[->, thick, grisTexte] (\x) -- (\y);
+\end{tikzpicture}
+\caption{L'ordre logique d'exécution. Les fonctions de fenêtre sont calculées à l'étape 5, après le
+filtrage et le regroupement.}
+\label{fig:ordre}
+\end{figure}
+
+Trois conséquences pratiques :
+\begin{enumerate}
+\item un alias défini dans le \code{SELECT} n'existe pas encore dans le \code{WHERE} ;
+\item on ne peut pas filtrer sur le résultat d'une fonction de fenêtre dans le \code{WHERE} (elle n'est
+pas encore calculée). PostgreSQL n'a pas de clause \code{QUALIFY} comme d'autres moteurs : on calcule
+la fenêtre dans une CTE, puis on filtre dans la requête suivante ;
+\item une fonction de fenêtre peut s'appliquer à un agrégat : \code{sum(sum(encours)) OVER ()} est
+valide, car le \code{GROUP BY} est déjà fait quand la fenêtre est calculée.
+\end{enumerate}
+
+\subsection{Les CTE : découper une requête en étapes nommées}
+
+\begin{analogie}{la recette de cuisine}
+Une recette ne dit pas « mélange les œufs battus avec la farine tamisée et le beurre fondu cuit à feu
+doux » en une seule phrase. Elle découpe : \emph{1. Fais fondre le beurre. 2. Bats les œufs.
+3. Mélange.} Chaque étape a un nom, et la suivante l'utilise. Une CTE fait la même chose pour une
+requête.
+\end{analogie}
+
+\begin{definition}{CTE (Common Table Expression)}
+Une sous-requête nommée, définie avec \code{WITH nom AS (...)} avant la requête principale. Chaque CTE
+peut utiliser les précédentes. Elle n'existe que le temps de la requête.
+\end{definition}
+
+\begin{lstlisting}[style=sql]
+WITH impayes AS (                          -- étape 1 : les échéances échues non soldées
+    SELECT pret_id, date_echeance
+    FROM echeancier_remboursements
+    WHERE date_echeance <= DATE '2026-09-30' AND montant_paye < montant_du
+),
+retards AS (                               -- étape 2 : le retard de chaque prêt
+    SELECT pret_id, DATE '2026-09-30' - min(date_echeance) AS jours_retard
+    FROM impayes
+    GROUP BY pret_id
+)
+SELECT count(*) FILTER (WHERE jours_retard > 90) AS prets_en_defaut   -- étape 3 : la réponse
+FROM retards;                                                         -- 7 088
+\end{lstlisting}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}P{3cm} L L@{}}
+\toprule
+\textbf{Outil} & \textbf{Durée de vie} & \textbf{Quand l'utiliser} \\
+\midrule
+Sous-requête & la requête & un calcul court, utilisé une fois \\
+CTE (\code{WITH}) & la requête & découper un calcul en étapes lisibles \\
+Vue & permanente (seule la définition est stockée) & une règle réutilisée par beaucoup de requêtes \\
+Vue matérialisée & permanente, résultat stocké & un calcul lourd, rafraîchi périodiquement
+(\code{REFRESH MATERIALIZED VIEW}) \\
+Table temporaire & la session & un résultat intermédiaire réutilisé par plusieurs requêtes \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{piege}{Piège --- Une CTE n'est pas un résultat stocké}
+Depuis PostgreSQL 12, une CTE lue une seule fois est \textbf{fusionnée} dans la requête principale,
+comme une sous-requête : l'optimiseur peut y pousser les filtres. Une CTE lue plusieurs fois est
+calculée une fois. On peut forcer le comportement avec \code{WITH x AS MATERIALIZED (...)} ou
+\code{NOT MATERIALIZED}. Et une CTE ne survit pas à la requête : pour réutiliser un résultat dans
+plusieurs requêtes, il faut une vue ou une table temporaire.
+\end{piege}
+
+\subsection{Les vues : écrire une règle une seule fois}
+
+Le calcul du retard sera utilisé par presque toutes les analyses de ce chapitre. Le réécrire à chaque
+fois, c'est risquer qu'une requête le calcule différemment des autres. Une \textbf{vue} enregistre la
+requête sous un nom ; on l'interroge ensuite comme une table :
+\begin{lstlisting}[style=sql]
+CREATE OR REPLACE VIEW v_situation_prets AS
+SELECT ... ;                                          -- la règle, écrite une fois
+
+SELECT count(*) FROM v_situation_prets WHERE en_defaut;   -- utilisée partout
+\end{lstlisting}
+La vue ne stocke aucune donnée : elle est recalculée à chaque interrogation, donc toujours à jour.
+
+\subsection{Les agrégats conditionnels : FILTER}
+
+Pour compter ou sommer seulement certaines lignes d'un groupe, la clause \code{FILTER} s'ajoute à
+n'importe quel agrégat :
+\begin{lstlisting}[style=sql]
+SELECT count(*)                                         AS nb_prets,
+       count(*)     FILTER (WHERE statut_pret = 'en_defaut') AS nb_defauts,
+       sum(montant_demande) FILTER (WHERE note_risque = 'A') AS montant_note_a
+FROM demandes_pret;
+\end{lstlisting}
+C'est l'équivalent, plus lisible, de \code{sum(CASE WHEN condition THEN x END)}. On l'utilisera aussi
+pour lire les paramètres en une ligne : \code{max(valeur) FILTER (WHERE cle = 'lgd')}.
+
+\subsection{Les fonctions de fenêtre}
+
+\begin{imagine}
+Au marathon de Clermont, chaque coureur reçoit deux classements : son rang au général et son rang dans
+sa catégorie d'âge. Pour les calculer, on ne « regroupe » pas les coureurs en une ligne par catégorie :
+chaque coureur garde \textbf{sa} ligne, avec son temps, et on lui \textbf{ajoute} une information
+calculée en regardant les autres coureurs de sa catégorie.
+\end{imagine}
+
+\begin{definition}{Fonction de fenêtre}
+Une fonction calculée pour chaque ligne à partir d'un ensemble de lignes liées à elle, la
+\textbf{fenêtre}, \textbf{sans regrouper les lignes}. Elle se reconnaît au mot-clé \code{OVER}.
+\end{definition}
+
+La différence avec \code{GROUP BY} est fondamentale :
+
+\begin{center}
+\begin{minipage}[t]{0.44\linewidth}\centering\small
+\code{GROUP BY note_risque}\\[3pt]
+\begin{tabular}{@{}cc@{}}
+\toprule
+note & \code{count(*)} \\
+\midrule
+A & 3 \\
+B & 2 \\
+\bottomrule
+\end{tabular}\\[3pt]
+{\footnotesize 5 prêts $\rightarrow$ 2 lignes}
+\end{minipage}
+\hfill
+\begin{minipage}[t]{0.52\linewidth}\centering\small
+\code{count(*) OVER (PARTITION BY note_risque)}\\[3pt]
+\begin{tabular}{@{}ccc@{}}
+\toprule
+prêt & note & nb dans la note \\
+\midrule
+101 & A & 3 \\
+102 & A & 3 \\
+103 & A & 3 \\
+104 & B & 2 \\
+105 & B & 2 \\
+\bottomrule
+\end{tabular}\\[3pt]
+{\footnotesize 5 prêts $\rightarrow$ 5 lignes}
+\end{minipage}
+\end{center}
+
+\subsubsection{L'anatomie d'une fenêtre}
+
+\begin{lstlisting}[style=sql]
+fonction(...) OVER (
+    PARTITION BY colonnes     -- découpe en groupes indépendants (facultatif)
+    ORDER BY colonnes         -- ordonne les lignes dans chaque groupe (facultatif)
+    ROWS BETWEEN ... AND ...  -- le cadre : quelles lignes autour de la ligne courante (facultatif)
+)
+\end{lstlisting}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}P{3cm} P{5.3cm} L@{}}
+\toprule
+\textbf{Famille} & \textbf{Fonctions} & \textbf{Usage dans le projet} \\
+\midrule
+Rangs & \code{ROW_NUMBER}, \code{RANK}, \code{DENSE_RANK}, \code{NTILE(n)} & déciles de risque, plus grosses expositions \\
+Décalage & \code{LAG}, \code{LEAD}, \code{FIRST_VALUE}, \code{LAST_VALUE} & évolution d'un mois sur l'autre, matrice de transition \\
+Agrégats fenêtrés & \code{SUM}, \code{AVG}, \code{COUNT}, \code{MIN}, \code{MAX} \code{OVER (...)} & cumuls, moyennes mobiles, parts du total \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsubsection{Les rangs : ROW\_NUMBER, RANK, DENSE\_RANK}
+
+Classons cinq prêts par PD décroissante (exemple illustratif, avec un ex æquo) :
+
+\begin{center}\small
+\begin{tabular}{@{}ccccc@{}}
+\toprule
+prêt & PD & \code{ROW_NUMBER()} & \code{RANK()} & \code{DENSE_RANK()} \\
+\midrule
+P1 & 0,30 & 1 & 1 & 1 \\
+P2 & 0,25 & 2 & 2 & 2 \\
+P3 & 0,25 & 3 & 2 & 2 \\
+P4 & 0,10 & 4 & \textbf{4} & \textbf{3} \\
+P5 & 0,05 & 5 & 5 & 4 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{itemize}
+\item \code{ROW_NUMBER} numérote sans jamais répéter ;
+\item \code{RANK} donne le même rang aux ex æquo, puis \textbf{saute} des rangs (1, 2, 2, 4) : c'est
+le classement sportif ;
+\item \code{DENSE_RANK} donne le même rang aux ex æquo \textbf{sans sauter} (1, 2, 2, 3).
+\end{itemize}
+
+\begin{piege}{Piège --- ROW\_NUMBER et les ex æquo}
+Entre P2 et P3, qui reçoit le numéro 2 ? \code{ROW_NUMBER} en choisit un au hasard, et le choix peut
+changer d'une exécution à l'autre. Pour un résultat reproductible, ajoute toujours un critère de
+départage : \code{ORDER BY probabilite_defaut DESC, pret_id}. Question d'entretien classique : « les
+trois plus gros prêts en défaut de chaque note » se fait avec \code{RANK} (les ex æquo sont tous
+gardés) ou \code{ROW_NUMBER} (exactement trois lignes), selon ce que veut le métier.
+\end{piege}
+
+\subsubsection{NTILE : découper en groupes de même taille}
+
+\code{NTILE(n)} répartit les lignes ordonnées en $n$ groupes aussi égaux que possible, numérotés de 1
+à $n$.
+
+\begin{calcul}{NTILE(4) sur 10 prêts}
+$10 = 4 \times 2 + 2$ : chaque groupe reçoit 2 prêts, et les $2$ prêts restants vont aux
+\textbf{premiers} groupes. Les tailles sont donc 3, 3, 2, 2.
+
+Sur ta base, les déciles de l'échantillon de test : $6\,482 = 10 \times 648 + 2$, donc les déciles 1 et
+2 contiennent 649 prêts et les huit autres 648. C'est exactement ce que tu obtiendras dans l'exercice
+2.3.
+\end{calcul}
+
+\subsubsection{LAG et LEAD : regarder la ligne d'avant ou d'après}
+
+\code{LAG(x)} renvoie la valeur de \code{x} sur la ligne \textbf{précédente} de la fenêtre,
+\code{LEAD(x)} sur la ligne \textbf{suivante}. Exemple réel : le retard de paiement du prêt 61, échéance
+par échéance.
+\begin{lstlisting}[style=sql]
+SELECT num_echeance, date_echeance, date_paiement,
+       date_paiement - date_echeance                                     AS retard,
+       LAG(date_paiement - date_echeance) OVER (ORDER BY num_echeance)   AS retard_precedent
+FROM echeancier_remboursements
+WHERE pret_id = 61 AND num_echeance BETWEEN 13 AND 19
+ORDER BY num_echeance;
+\end{lstlisting}
+
+\begin{center}\small
+\begin{tabular}{@{}cccrr@{}}
+\toprule
+\code{num_echeance} & \code{date_echeance} & \code{date_paiement} & \code{retard} & \code{retard_precedent} \\
+\midrule
+13 & 15/03/2026 & 13/03/2026 & $-2$ & NULL \\
+14 & 15/04/2026 & 14/04/2026 & $-1$ & $-2$ \\
+15 & 15/05/2026 & 18/05/2026 & 3 & $-1$ \\
+16 & 15/06/2026 & 15/06/2026 & 0 & 3 \\
+17 & 15/07/2026 & 03/08/2026 & 19 & 0 \\
+18 & 15/08/2026 & NULL & NULL & 19 \\
+19 & 15/09/2026 & 15/09/2026 & 0 & NULL \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Trois remarques : la première ligne n'a pas de précédent (NULL) ; un retard négatif est un paiement en
+avance ; et l'échéance 18, impayée, a un retard NULL, que la ligne 19 hérite comme « précédent ».
+\code{LAG(x, 1, 0)} remplace l'absence de ligne précédente par 0, mais pas une valeur NULL existante.
+
+\subsubsection{Les agrégats fenêtrés et le cadre}
+
+Avec \code{ORDER BY}, un agrégat fenêtré devient \textbf{cumulatif}. Le \textbf{cadre}
+(\code{ROWS BETWEEN}) précise exactement quelles lignes entrent dans le calcul
+(figure~\ref{fig:cadre}).
+\begin{lstlisting}[style=sql]
+sum(encaisse) OVER (ORDER BY mois)                                        -- cumul depuis le début
+avg(encaisse) OVER (ORDER BY mois ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) -- moyenne mobile 3 mois
+sum(encaisse) OVER ()                                                     -- total de toutes les lignes
+\end{lstlisting}
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[font=\small,
+  ligne/.style={draw=grisTexte, minimum width=2.6cm, minimum height=0.55cm, fill=white},
+  cour/.style={ligne, fill=bleuFond, draw=bleuML, line width=0.9pt}]
+  \foreach \i/\m in {1/janvier,2/février,3/mars,4/avril,5/mai,6/juin}
+    \node[ligne] (l\i) at (0,-0.6*\i) {\m};
+  \node[cour] at (0,-3.0) {\textbf{mai (ligne courante)}};
+  \draw[decorate, decoration={brace, amplitude=5pt}, thick, vertCadre] (1.45,-1.55) -- (1.45,-3.25)
+     node[midway, right=7pt, align=left, font=\footnotesize] {\textbf{ROWS BETWEEN 2 PRECEDING}\\\textbf{AND CURRENT ROW} : mars, avril, mai};
+  \draw[decorate, decoration={brace, amplitude=5pt, mirror}, thick, orangeEx] (-1.45,-0.35) -- (-1.45,-3.25)
+     node[midway, left=7pt, align=right, font=\footnotesize] {\textbf{ORDER BY mois}\\(cumul) : de janvier à mai};
+\end{tikzpicture}
+\caption{Deux cadres de fenêtre pour la ligne de mai.}
+\label{fig:cadre}
+\end{figure}
+
+\begin{piege}{Piège --- Le cadre par défaut est RANGE, pas ROWS}
+Avec un \code{ORDER BY} et sans cadre explicite, PostgreSQL utilise
+\code{RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW}. \code{RANGE} inclut les lignes
+\textbf{ex æquo} avec la ligne courante : si deux lignes ont la même date, le « cumul » de la première
+contient déjà la seconde. Pour un cumul ligne à ligne, écris \code{ROWS} explicitement. Même cause,
+autre symptôme : \code{LAST_VALUE(x) OVER (ORDER BY ...)} renvoie la ligne courante, pas la dernière,
+sauf à écrire \code{ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING}.
+\end{piege}
+
+Quand plusieurs fonctions partagent la même fenêtre, la clause \code{WINDOW} évite de la répéter :
+\begin{lstlisting}[style=sql]
+SELECT LAG(retard, 1) OVER w, LAG(retard, 2) OVER w
+FROM ...
+WINDOW w AS (PARTITION BY pret_id ORDER BY num_echeance);
+\end{lstlisting}
+
+\subsection{Les sous-totaux : ROLLUP}
+
+\code{GROUP BY ROLLUP (stage)} produit une ligne par stage \textbf{plus une ligne de total}, où la
+colonne \code{stage} vaut NULL. On l'affiche avec \code{coalesce(stage::text, 'Total')}. Avec
+plusieurs colonnes, \code{ROLLUP (a, b)} donne les sous-totaux par \code{a} puis le total général ; la
+fonction \code{GROUPING(a)} permet de distinguer un vrai NULL d'une ligne de sous-total.
+
+\subsection{Les indicateurs du risque, traduits en SQL}
+
+\subsubsection{Le retard et l'encours de chaque prêt}
+
+La définition du DPD (partie 2) se traduit directement :
+\begin{lstlisting}[style=sql]
+coalesce(date_ref - min(e.date_echeance)
+           FILTER (WHERE e.date_echeance <= date_ref AND e.montant_paye < e.montant_du), 0) AS jours_retard
+\end{lstlisting}
+Le \code{min} cherche l'échéance la plus ancienne parmi celles qui sont échues et non soldées ; s'il
+n'y en a aucune, il vaut NULL, et \code{coalesce} le remplace par 0. L'encours (capital non remboursé)
+tient compte des paiements partiels au prorata :
+$\sum \text{part\_capital} \times (1 - \text{montant\_payé} / \text{montant\_dû})$.
+
+\subsubsection{L'AUC et le Gini, sans bibliothèque}
+
+\begin{definition}{AUC}
+L'AUC (aire sous la courbe ROC) est la probabilité qu'un prêt en défaut, tiré au hasard, ait une PD
+\textbf{plus élevée} qu'un prêt sain tiré au hasard. 0,5 = hasard, 1 = classement parfait. Le
+\textbf{Gini} vaut $2 \times AUC - 1$.
+\end{definition}
+
+Cette définition donne une formule calculable en SQL, celle de la statistique de Mann--Whitney. On
+range tous les prêts par PD croissante (rang 1 = la plus petite PD). Avec $n_1$ défauts et $n_0$ prêts
+sains :
+\[
+\boxed{\;AUC = \frac{\sum \text{rangs des défauts} - \dfrac{n_1(n_1+1)}{2}}{n_1 \times n_0}\;}
+\]
+\textbf{Pourquoi ?} La somme des rangs des défauts compte, pour chaque défaut, le nombre de prêts
+classés en dessous de lui (plus lui-même). En retirant $n_1(n_1+1)/2$, on enlève les défauts classés
+sous d'autres défauts : il reste exactement le nombre de paires (défaut, sain) bien ordonnées, que l'on
+divise par le nombre total de paires $n_1 n_0$.
+
+\begin{calcul}{l'AUC de cinq prêts}
+Deux défauts (D1 : PD 0,9 ; D2 : PD 0,4) et trois prêts sains (S1 : 0,6 ; S2 : 0,3 ; S3 : 0,1).
+\begin{enumerate}
+\item \textbf{Par les paires.} 6 paires (défaut, sain). D1 dépasse S1, S2, S3 : 3 paires bien
+ordonnées. D2 dépasse S2 et S3, pas S1 : 2 paires. $AUC = 5/6 = 0{,}833$.
+\item \textbf{Par les rangs.} Par PD croissante : S3 = 1, S2 = 2, D2 = 3, S1 = 4, D1 = 5. Somme des rangs
+des défauts : $3 + 5 = 8$. $AUC = (8 - 2 \times 3 / 2) / (2 \times 3) = 5/6 = 0{,}833$.
+\item Gini $= 2 \times 0{,}833 - 1 = 0{,}667$.
+\end{enumerate}
+En cas d'ex æquo, chaque prêt reçoit le \textbf{rang moyen} de son groupe.
+\end{calcul}
+
+\subsubsection{La courbe de gains, la matrice de transition, l'analyse par génération}
+
+\begin{itemize}
+\item \textbf{Courbe de gains} : on classe les prêts en déciles de PD décroissante et on mesure la part
+cumulée des défauts « captés » par les premiers déciles. Si refuser les 10~\% les plus risqués évite
+45~\% des défauts, le modèle est très discriminant.
+\item \textbf{Matrice de transition} (\emph{roll rates}) : pour chaque tranche de retard en fin de mois,
+la répartition des prêts dans les tranches le mois suivant. Elle montre la dynamique du risque :
+quelle part des prêts à 31--60 jours se régularise, quelle part s'aggrave.
+\item \textbf{Analyse par génération} (\emph{vintage}) : on regroupe les prêts par trimestre d'octroi et
+on suit leur taux de défaut cumulé après 6, 12, 18, 24 mois d'ancienneté (\emph{months on book}, MOB).
+Une génération qui fait défaut plus vite que les précédentes signale un relâchement de la politique
+d'octroi.
+\end{itemize}
+
+\begin{piege}{Piège --- Comparer des générations qui n'ont pas le même âge}
+Une génération accordée il y a 3 mois n'a pas encore eu le temps de faire défaut : son taux de défaut
+« après 12 mois » n'existe pas. Si on le calcule quand même, les jeunes générations paraissent
+excellentes. Pour chaque horizon de $h$ mois, on ne garde que les prêts \textbf{observés pendant au
+moins $h$ mois}.
+\end{piege}
+
+\subsection{Performance : filtrer avant de joindre}
+
+Une requête analytique sur 1,1 million de mensualités peut prendre des secondes ou des minutes selon
+la façon dont elle est écrite. La règle la plus rentable : \textbf{réduire les données avant de les
+joindre}. Dans la matrice de transition (exercice 2.6), on joint chaque fin de mois à chaque prêt et à
+ses échéances : en ne gardant d'abord que les échéances qui \emph{peuvent} être impayées pendant la
+période étudiée, la requête passe de 7 à 3 secondes. \code{EXPLAIN ANALYZE} permet de vérifier
+l'effet de chaque réécriture.
+
+% =============================================================================
+\section{Exercices guidés}
+
+\begin{exercice}{2.1}{La situation de chaque prêt à la date d'arrêté}
+\begin{enumerate}[label=\alph*)]
+\item Crée la vue \code{v_situation_prets} : pour chaque prêt accordé avant la date de référence, son
+retard (DPD), son encours, ses impayés échus, le nombre de mois restants et un booléen
+\code{en_defaut} (retard supérieur au seuil). Les paramètres sont lus dans \code{parametres_risque}.
+\item Donne la répartition des prêts \textbf{non soldés} par tranche de retard (à jour, 1--30, 31--60,
+61--90, plus de 90 jours) : nombre, encours, part de l'encours total.
+\item Calcule le PAR30 et le PAR90.
+\end{enumerate}
+\end{exercice}
+
+\begin{correction}{2.1}
+\textbf{a) La vue.} Une première CTE lit les paramètres en une ligne (agrégats \code{FILTER}). La
+seconde joint les prêts à leurs échéances et calcule tout par prêt. Le \code{CROSS JOIN} ajoute la
+ligne des paramètres à chaque ligne : c'est le moyen simple de rendre une constante disponible partout.
+
+\begin{lstlisting}[style=long]
+CREATE OR REPLACE VIEW v_situation_prets AS
+WITH arrete AS (
+    SELECT max(valeur_date) FILTER (WHERE cle = 'date_reference')  AS date_ref,
+           max(valeur)      FILTER (WHERE cle = 'seuil_defaut_jours') AS seuil_defaut
+    FROM parametres_risque
+),
+calcul AS (
+    SELECT p.pret_id, p.client_id, p.note_risque, p.motif_pret, p.duree_mois, p.date_decision,
+           a.date_ref, a.seuil_defaut,
+           -- DPD : jours écoulés depuis la plus ancienne échéance échue et non soldée (0 si tout est à jour)
+           coalesce(a.date_ref - min(e.date_echeance)
+                      FILTER (WHERE e.date_echeance <= a.date_ref AND e.montant_paye < e.montant_du), 0) AS jours_retard,
+           -- encours : capital pas encore remboursé (un paiement partiel couvre capital et intérêts au prorata)
+           round(sum(e.part_capital * (1 - e.montant_paye / e.montant_du)), 2)                         AS encours,
+           coalesce(sum(e.montant_du - e.montant_paye) FILTER (WHERE e.date_echeance <= a.date_ref), 0) AS impayes,
+           count(*) FILTER (WHERE e.date_echeance > a.date_ref)                                        AS mois_restants
+    FROM demandes_pret p
+    JOIN echeancier_remboursements e USING (pret_id)
+    CROSS JOIN arrete a
+    WHERE p.statut_dossier = 'accorde' AND p.date_decision <= a.date_ref
+    GROUP BY p.pret_id, a.date_ref, a.seuil_defaut    -- p.pret_id est la clé : les autres colonnes de p en dépendent
+)
+SELECT pret_id, client_id, note_risque, motif_pret, duree_mois, date_decision, date_ref,
+       jours_retard, encours, impayes, mois_restants,
+       jours_retard > seuil_defaut AS en_defaut       -- « plus de 90 jours » (art. 178 CRR)
+FROM calcul;
+\end{lstlisting}
+
+\textbf{Remarque sur le GROUP BY.} On sélectionne \code{p.note_risque}, \code{p.duree_mois}\dots sans
+les mettre dans le \code{GROUP BY}. C'est permis parce que \code{p.pret_id}, clé primaire de
+\code{demandes_pret}, y figure : PostgreSQL sait que les autres colonnes de \code{p} en dépendent.
+
+\textbf{b) Les tranches.} La CTE classe chaque prêt dans une tranche (les numéros devant les libellés
+donnent l'ordre de tri). \code{sum(sum(encours)) OVER ()} calcule le total de toutes les tranches sans
+perdre le détail : c'est une fonction de fenêtre appliquée au résultat du \code{GROUP BY}.
+
+\begin{lstlisting}[style=long]
+WITH tranches AS (
+    SELECT encours,
+           CASE WHEN jours_retard = 0  THEN '1. À jour'
+                WHEN jours_retard <= 30 THEN '2. 1 à 30 jours'
+                WHEN jours_retard <= 60 THEN '3. 31 à 60 jours'
+                WHEN jours_retard <= 90 THEN '4. 61 à 90 jours'
+                ELSE                         '5. Plus de 90 jours' END AS tranche
+    FROM v_situation_prets
+    WHERE encours > 0                                  -- les prêts soldés ne portent plus de risque
+)
+SELECT tranche, count(*) AS nb_prets, sum(encours) AS encours,
+       -- SUM(SUM(...)) OVER () : le total de toutes les tranches, sans perdre le détail
+       round(100 * sum(encours) / sum(sum(encours)) OVER (), 2) AS part_encours_pct
+FROM tranches
+GROUP BY tranche
+ORDER BY tranche;
+\end{lstlisting}
+
+\textbf{c) PAR30 et PAR90.}
+\begin{lstlisting}[style=long]
+SELECT sum(encours)                                                               AS encours_total,
+       round(100 * sum(encours) FILTER (WHERE jours_retard > 30) / sum(encours), 2) AS par30_pct,
+       round(100 * sum(encours) FILTER (WHERE en_defaut)         / sum(encours), 2) AS par90_pct
+FROM v_situation_prets
+WHERE encours > 0;
+\end{lstlisting}
+
+\begin{resultat}
+\begin{center}\small
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Tranche & Prêts & Encours (€) & Part de l'encours \\
+\midrule
+1. À jour & 13\,480 & 73\,884\,266,09 & 55,15~\% \\
+2. 1 à 30 jours & 714 & 3\,948\,710,84 & 2,95~\% \\
+3. 31 à 60 jours & 201 & 1\,081\,975,60 & 0,81~\% \\
+4. 61 à 90 jours & 18 & 69\,932,39 & 0,05~\% \\
+5. Plus de 90 jours & 7\,088 & 54\,978\,554,44 & 41,04~\% \\
+\bottomrule
+\end{tabular}
+
+\smallskip
+Encours total : 133\,963\,439,36~€ \qquad PAR30 : \textbf{41,90~\%} \qquad PAR90 : \textbf{41,04~\%}
+\end{center}
+Les 10\,909 prêts soldés (encours nul) sont exclus : $13\,480 + 714 + 201 + 18 + 7\,088 = 21\,501$ prêts
+vivants.
+\end{resultat}
+
+\begin{observation}[Un PAR90 de 41~\% : réaliste ?]
+Non : dans une banque de crédit à la consommation, le PAR90 se mesure plutôt en quelques pour cent.
+Deux raisons à cet écart, qu'il faut savoir expliquer. D'abord, le jeu de données contient 21,9~\% de
+défauts, bien plus qu'un portefeuille réel. Ensuite, un prêt en défaut cesse de payer et garde tout son
+encours, alors que les prêts sains s'amortissent et 10\,909 sont déjà soldés : dans l'encours
+\emph{restant}, les défauts pèsent donc de plus en plus lourd. Le calcul est juste ; c'est le
+portefeuille qui est atypique.
+\end{observation}
+\end{correction}
+
+\begin{exercice}{2.2}{Provisions IFRS 9 : stage, EAD, PD, LGD et perte attendue}
+Pour chaque prêt non soldé, détermine son stage (seuils lus dans les paramètres), son EAD (l'encours),
+la PD du modèle champion, la PD utilisée selon le stage ($PD_m = 1-(1-PD)^{m/n}$) et l'ECL. Présente le
+nombre de prêts, l'EAD, la PD moyenne, l'ECL et le taux de couverture (ECL / EAD) par stage, avec une
+ligne de total. Vérifie enfin qu'aucun prêt n'est oublié faute de score.
+\end{exercice}
+
+\begin{correction}{2.2}
+Trois CTE, trois étapes : les paramètres ; le stage de chaque prêt ; la PD utilisée. La requête finale
+agrège avec \code{ROLLUP}.
+
+\begin{lstlisting}[style=long]
+WITH parametres AS (
+    SELECT max(valeur) FILTER (WHERE cle = 'lgd')                AS lgd,
+           max(valeur) FILTER (WHERE cle = 'seuil_defaut_jours') AS seuil_defaut,
+           max(valeur) FILTER (WHERE cle = 'seuil_stage2_jours') AS seuil_stage2
+    FROM parametres_risque
+),
+stages AS (
+    SELECT s.pret_id, s.encours AS ead, s.duree_mois,
+           greatest(s.mois_restants, 1) AS mois_restants,       -- un prêt échu mais impayé : au moins 1 mois
+           ps.probabilite_defaut        AS pd_vie_entiere,
+           CASE WHEN s.jours_retard > prm.seuil_defaut THEN 3   -- défaut avéré
+                WHEN s.jours_retard > prm.seuil_stage2 THEN 2   -- dégradation significative du risque
+                ELSE 1 END AS stage
+    FROM v_situation_prets s
+    JOIN predictions_scoring_ml ps ON ps.pret_id = s.pret_id AND ps.est_champion
+    CROSS JOIN parametres prm
+    WHERE s.encours > 0
+),
+pertes AS (
+    -- La PD du modèle porte sur toute la durée du prêt. Avec un risque mensuel constant,
+    -- la probabilité de défaut sur m mois vaut 1 − (1 − PD)^(m / durée).
+    SELECT st.*,
+           CASE stage
+               WHEN 3 THEN 1                                                                  -- défaut : PD = 1
+               WHEN 2 THEN 1 - (1 - pd_vie_entiere) ^ (mois_restants::numeric / duree_mois)   -- vie restante
+               ELSE        1 - (1 - pd_vie_entiere) ^ (least(mois_restants, 12)::numeric / duree_mois)  -- 12 mois
+           END AS pd_utilisee
+    FROM stages st
+)
+SELECT coalesce(stage::text, 'Total')                    AS stage_ifrs9,
+       count(*)                                           AS nb_prets,
+       sum(ead)                                           AS ead,
+       round(100 * avg(pd_utilisee), 2)                   AS pd_moyenne_pct,
+       round(sum(pd_utilisee * prm.lgd * ead), 2)         AS ecl,
+       round(100 * sum(pd_utilisee * prm.lgd * ead) / sum(ead), 2) AS taux_couverture_pct
+FROM pertes
+CROSS JOIN parametres prm
+GROUP BY ROLLUP (stage)                                  -- ROLLUP ajoute la ligne de total
+ORDER BY stage;
+
+-- Contrôle qualité : un prêt accordé sans score du modèle champion disparaîtrait du calcul (jointure interne)
+SELECT count(*) AS prets_sans_score
+FROM v_situation_prets s
+WHERE NOT EXISTS (SELECT 1 FROM predictions_scoring_ml ps WHERE ps.pret_id = s.pret_id AND ps.est_champion);
+\end{lstlisting}
+
+\textbf{Deux détails qui comptent.} \code{mois_restants::numeric} : sans conversion, la division de
+deux entiers serait entière ($12/36 = 0$). \code{greatest(mois_restants, 1)} : un prêt dont toutes les
+échéances sont passées mais impayées a 0 mois restant, ce qui annulerait sa PD.
+
+\begin{resultat}
+\begin{center}\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Stage & Prêts & EAD (€) & PD moyenne & ECL (€) & Couverture \\
+\midrule
+1 & 14\,194 & 77\,832\,976,93 & 2,20~\% & 856\,830,45 & 1,10~\% \\
+2 & 219 & 1\,151\,907,99 & 3,80~\% & 29\,949,20 & 2,60~\% \\
+3 & 7\,088 & 54\,978\,554,44 & 100,00~\% & 24\,740\,349,50 & 45,00~\% \\
+\textbf{Total} & 21\,501 & 133\,963\,439,36 & 34,45~\% & \textbf{25\,627\,129,15} & 19,13~\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+Prêts sans score : \textbf{0}.
+\end{resultat}
+
+\textbf{Lecture.} Le stage 3 représente 96,5~\% des provisions ; son taux de couverture vaut exactement
+la LGD (45~\%), puisque sa PD vaut 100~\%. Les 14\,194 prêts du stage 1 (58~\% de l'EAD) ne coûtent que
+1,10~\% de leur encours. Le stage 2 compte 219 prêts : les $201 + 18$ prêts des tranches 31--60 et
+61--90 jours de l'exercice précédent.
+\end{correction}
+
+\begin{exercice}{2.3}{Le modèle classe-t-il bien ? Déciles de risque sur l'échantillon test}
+Sur les prêts de l'échantillon \textbf{test}, découpe les prédictions du modèle champion en 10 déciles
+de PD décroissante (décile 1 = les plus risqués). Pour chaque décile : nombre de prêts, PD moyenne
+prédite, taux de défaut observé, nombre de défauts et part cumulée des défauts captés.
+\end{exercice}
+
+\begin{correction}{2.3}
+\begin{lstlisting}[style=long]
+WITH test AS (
+    SELECT ps.probabilite_defaut AS pd, s.en_defaut::int AS defaut
+    FROM predictions_scoring_ml ps
+    JOIN echantillons_modele em USING (pret_id)
+    JOIN v_situation_prets s   USING (pret_id)
+    WHERE ps.est_champion AND em.echantillon = 'test'    -- jamais sur l'apprentissage : résultats trop beaux
+),
+deciles AS (
+    SELECT pd, defaut, NTILE(10) OVER (ORDER BY pd DESC) AS decile   -- décile 1 = les 10 % les plus risqués
+    FROM test
+)
+SELECT decile,
+       count(*)                     AS nb_prets,
+       round(100 * avg(pd), 2)      AS pd_predite_pct,
+       round(100 * avg(defaut), 2)  AS taux_defaut_observe_pct,
+       sum(defaut)                  AS nb_defauts,
+       -- courbe de gains : part cumulée des défauts captés en refusant les déciles 1 à k
+       round(100.0 * sum(sum(defaut)) OVER (ORDER BY decile) / sum(sum(defaut)) OVER (), 1) AS defauts_captes_cumules_pct
+FROM deciles
+GROUP BY decile
+ORDER BY decile;
+\end{lstlisting}
+
+\textbf{Les astuces.} \code{en_defaut::int} convertit le booléen en 0 ou 1 : sa moyenne est un taux,
+sa somme un nombre de défauts. La dernière colonne empile deux niveaux : \code{sum(defaut)} agrège
+chaque décile, puis \code{sum(...) OVER (ORDER BY decile)} cumule les déciles.
+
+\begin{resultat}
+\begin{center}\small
+\begin{tabular}{@{}crrrrr@{}}
+\toprule
+Décile & Prêts & PD prédite & Défaut observé & Défauts & Défauts captés (cumul) \\
+\midrule
+1 & 649 & 97,55~\% & 100,00~\% & 649 & 45,8~\% \\
+2 & 649 & 67,59~\% & 64,41~\% & 418 & 75,2~\% \\
+3 & 648 & 20,06~\% & 15,28~\% & 99 & 82,2~\% \\
+4 & 648 & 10,97~\% & 12,65~\% & 82 & 88,0~\% \\
+5 & 648 & 7,47~\% & 10,03~\% & 65 & 92,6~\% \\
+6 & 648 & 5,23~\% & 5,56~\% & 36 & 95,1~\% \\
+7 & 648 & 3,66~\% & 5,86~\% & 38 & 97,8~\% \\
+8 & 648 & 2,31~\% & 3,55~\% & 23 & 99,4~\% \\
+9 & 648 & 1,10~\% & 1,08~\% & 7 & 99,9~\% \\
+10 & 648 & 0,24~\% & 0,15~\% & 1 & 100,0~\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{resultat}
+
+\begin{center}
+\centering
+\begin{tikzpicture}
+\begin{axis}[ybar, bar width=8pt, width=14.5cm, height=6cm, ymin=0, ymax=105,
+  xlabel={Décile de PD (1 = les plus risqués)}, ylabel={\%}, xtick={1,...,10},
+  legend style={at={(0.5,1.03)}, anchor=south, legend columns=3, draw=none, font=\small},
+  tick label style={font=\footnotesize}, label style={font=\small}, grid=major, grid style={gray!20},
+  axis lines*=left, enlarge x limits=0.07]
+\addplot[fill=bleuML!40, draw=bleuML] coordinates {(1,97.55) (2,67.59) (3,20.06) (4,10.97) (5,7.47) (6,5.23) (7,3.66) (8,2.31) (9,1.10) (10,0.24)};
+\addplot[fill=rouge!70, draw=rouge] coordinates {(1,100) (2,64.41) (3,15.28) (4,12.65) (5,10.03) (6,5.56) (7,5.86) (8,3.55) (9,1.08) (10,0.15)};
+\addplot[sharp plot, mark=*, thick, vertCadre] coordinates {(1,45.8) (2,75.2) (3,82.2) (4,88.0) (5,92.6) (6,95.1) (7,97.8) (8,99.4) (9,99.9) (10,100)};
+\legend{PD prédite, Taux de défaut observé, Défauts captés (cumul)}
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{Déciles du modèle champion sur les 6\,482 prêts de test : PD prédite et défaut observé sont
+proches décile par décile, et les deux premiers déciles concentrent 75~\% des défauts.}
+\label{fig:deciles}
+\end{center}
+
+\textbf{Lecture.} Deux qualités distinctes apparaissent. La \textbf{discrimination} : le taux de défaut
+baisse régulièrement du décile 1 au décile 10, et refuser les 10~\% les plus risqués éviterait 45,8~\%
+des défauts. La \textbf{calibration} : dans chaque décile, la PD prédite est proche du taux observé
+(67,6~\% contre 64,4~\% dans le décile 2), ce qui autorise à utiliser la PD comme une vraie probabilité,
+par exemple dans le calcul des provisions.
+\end{correction}
+
+\begin{exercice}{2.4}{Encaissements mensuels : cumul, moyenne mobile et évolution}
+Calcule les sommes encaissées chaque mois depuis octobre 2025 (d'après la date de paiement), puis pour
+chaque mois : le cumul depuis octobre, la moyenne mobile sur trois mois et l'évolution en pourcentage
+par rapport au mois précédent.
+\end{exercice}
+
+\begin{correction}{2.4}
+\begin{lstlisting}[style=long]
+WITH mensuel AS (
+    SELECT date_trunc('month', date_paiement)::date AS mois, sum(montant_paye) AS encaisse
+    FROM echeancier_remboursements
+    WHERE date_paiement >= DATE '2025-10-01'
+    GROUP BY 1
+)
+SELECT mois, encaisse,
+       sum(encaisse) OVER (ORDER BY mois)                                           AS cumul_depuis_octobre,
+       round(avg(encaisse) OVER (ORDER BY mois ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), 2) AS moyenne_mobile_3_mois,
+       round(100 * (encaisse / LAG(encaisse) OVER (ORDER BY mois) - 1), 1)          AS evolution_pct
+FROM mensuel
+ORDER BY mois;
+\end{lstlisting}
+
+\textbf{Pourquoi \code{date_paiement IS NOT NULL} n'est pas écrit ?} Le filtre \code{>= DATE '2025-10-01'}
+élimine déjà les NULL : une comparaison avec NULL n'est jamais vraie. Le cumul utilise ici le cadre par
+défaut (\code{RANGE}) sans risque, car chaque mois n'apparaît qu'une fois.
+
+\begin{center}
+\centering
+\begin{tikzpicture}
+\begin{axis}[width=14.5cm, height=5.6cm, ymin=4.4, ymax=5.7,
+  xtick={1,...,12}, xticklabels={oct.,nov.,déc.,janv.,févr.,mars,avr.,mai,juin,juil.,août,sept.},
+  ylabel={Millions d'euros}, legend style={at={(0.02,0.05)}, anchor=south west, draw=none, font=\small},
+  tick label style={font=\footnotesize}, label style={font=\small}, grid=major, grid style={gray!20},
+  axis lines*=left, yticklabel style={/pgf/number format/.cd, fixed, precision=1, use comma}]
+\addplot[mark=*, thick, bleuML] coordinates {(1,5.511) (2,5.524) (3,5.503) (4,5.412) (5,5.262) (6,5.312)
+  (7,5.134) (8,5.085) (9,5.029) (10,5.097) (11,4.931) (12,4.556)};
+\addplot[dashed, thick, orangeEx] coordinates {(1,5.511) (2,5.518) (3,5.513) (4,5.480) (5,5.392) (6,5.329)
+  (7,5.236) (8,5.177) (9,5.083) (10,5.070) (11,5.019) (12,4.861)};
+\legend{Encaissé dans le mois, Moyenne mobile 3 mois}
+\end{axis}
+\end{tikzpicture}
+\captionof{figure}{Encaissements mensuels d'octobre 2025 à septembre 2026 (62,36 millions d'euros au total).}
+\label{fig:encaissements}
+\end{center}
+
+\textbf{Lecture.} Les encaissements baissent lentement : le portefeuille s'amortit, les prêts en
+défaut ne paient plus, et les nouveaux prêts se raréfient (les dernières demandes du jeu simulé datent de fin
+juin 2026). La chute de septembre ($-7{,}6~\%$) est en partie un \textbf{effet de bord} : les
+mensualités de fin septembre payées avec quelques jours de retard ne seront encaissées qu'en octobre,
+après la date d'arrêté. Réflexe à avoir en entretien : \emph{la dernière période d'une série est souvent
+incomplète}.
+\end{correction}
+
+% =============================================================================
+\section{Exercices à faire seul}
+
+\begin{exercice}{2.5}{Champion contre challengers : AUC, Gini, rappel et taux de refus}
+Sur l'échantillon test, calcule pour \textbf{chacun des trois modèles} : l'AUC (formule des rangs, avec
+rangs moyens en cas d'ex æquo), le Gini, le rappel (part des défauts que le modèle aurait refusés), le
+taux de refus et le taux de défaut parmi les prêts qu'il aurait accordés. Le champion mérite-t-il sa
+place ?
+\end{exercice}
+
+\begin{indice}
+\begin{itemize}
+\item Le rang par modèle : \code{RANK() OVER (PARTITION BY version_modele ORDER BY pd)}.
+\item Le rang moyen d'un groupe d'ex æquo de taille $t$ dont le premier rang est $R$ vaut
+$R + (t-1)/2$ ; $t$ s'obtient avec \code{count(*) OVER (PARTITION BY version_modele, pd)}.
+\item Puis un \code{GROUP BY version_modele} avec des agrégats \code{FILTER}. Attention aux divisions
+entières.
+\end{itemize}
+\end{indice}
+
+\begin{exercice}{2.6}{La matrice de transition entre fins de mois, avec LEAD}
+Pour chaque fin de mois de septembre 2025 à septembre 2026, calcule le retard de chaque prêt
+\textbf{à cette date} (une échéance est impayée à la date $D$ si elle est échue à $D$ et n'était pas
+soldée à $D$). Classe les prêts en tranches, puis donne, pour chaque tranche de départ, la répartition
+(en~\%) des prêts dans les tranches \textbf{le mois suivant}. Écarte les prêts terminés et soldés.
+\end{exercice}
+
+\begin{indice}
+\begin{itemize}
+\item Les fins de mois : \code{generate_series} sur les premiers jours de mois, puis
+\code{+ INTERVAL '1 month - 1 day'}.
+\item « Non soldée à $D$ » : \code{date_paiement IS NULL OR date_paiement > D}.
+\item Un prêt sans impayé n'a aucune échéance à joindre : il faut un \code{LEFT JOIN} pour le garder
+(avec un retard de 0).
+\item La tranche du mois suivant : \code{LEAD(tranche) OVER (PARTITION BY pret_id ORDER BY date_arrete)}.
+\item Performance : filtre les échéances inutiles \emph{avant} la jointure.
+\end{itemize}
+\end{indice}
+
+\begin{exercice}{2.7}{L'analyse par génération (vintage)}
+Regroupe les prêts accordés par trimestre d'octroi. Pour chaque génération, calcule le taux de défaut
+cumulé après 6, 12, 18 et 24 mois (MOB). La date d'entrée en défaut d'un prêt est la date d'échéance de
+sa première mensualité restée impayée plus de 90 jours, plus 91 jours. Ajoute l'écart du MOB 12 avec
+la génération précédente. Que remarques-tu sur les générations récentes ?
+\end{exercice}
+
+\begin{indice}
+\begin{itemize}
+\item Une échéance a été impayée plus de 90 jours si
+\code{coalesce(date_paiement, date_ref) - date_echeance > 90}.
+\item \code{date_trunc('quarter', date_decision)} donne le trimestre.
+\item Les horizons : \code{CROSS JOIN (VALUES (6), (12), (18), (24)) AS h (mois)}, en ne gardant que
+les prêts observés au moins \code{h.mois} mois (relis le piège des générations).
+\end{itemize}
+\end{indice}
+
+\begin{exercice}{2.8}{Classements et signal précoce}
+\begin{enumerate}[label=\alph*)]
+\item Les trois plus grosses expositions en défaut de chaque note de risque, avec le nom du client et
+la part de chacune dans l'encours en défaut de sa note.
+\item Le \textbf{signal précoce} : les 20 prêts encore à jour ou presque (retard actuel $\leq 30$ jours,
+encours non nul) dont le retard de paiement \textbf{augmente} sur chacune de leurs trois dernières
+échéances payées, la dernière étant payée en retard. Trie par retard décroissant puis par encours.
+\end{enumerate}
+\end{exercice}
+
+\begin{indice}
+\begin{itemize}
+\item a) \code{RANK() OVER (PARTITION BY note_risque ORDER BY encours DESC)} dans une CTE, puis
+\code{WHERE rang <= 3} dans la requête suivante.
+\item b) \code{LAG(retard, 1)} et \code{LAG(retard, 2)} sur une même fenêtre (clause \code{WINDOW}), et
+\code{ROW_NUMBER() OVER (PARTITION BY pret_id ORDER BY num_echeance DESC) = 1} pour la dernière échéance
+payée.
+\end{itemize}
+\end{indice}
+
+% =============================================================================
+\section{Synthèse pour les entretiens}
+
+\begin{resume}
+\begin{enumerate}
+\item \textbf{Ordre d'exécution} : FROM, WHERE, GROUP BY, HAVING, SELECT (fenêtres), DISTINCT, ORDER BY,
+LIMIT. On filtre une fenêtre dans une requête englobante (pas de \code{QUALIFY} dans PostgreSQL).
+\item \textbf{CTE} pour découper, \textbf{vue} pour réutiliser une règle, \textbf{FILTER} pour les
+agrégats conditionnels.
+\item \textbf{Fenêtres} : elles gardent les lignes. \code{PARTITION BY} découpe, \code{ORDER BY} ordonne,
+le cadre (\code{ROWS}) délimite.
+\item \textbf{Rangs} : \code{ROW_NUMBER} (unique), \code{RANK} (saute), \code{DENSE_RANK} (ne saute
+pas), \code{NTILE} (groupes égaux, les premiers reçoivent le reste).
+\item \textbf{LAG / LEAD} : ligne précédente / suivante ; NULL au bord.
+\item \textbf{Cadre par défaut} : \code{RANGE} avec les ex æquo ; écrire \code{ROWS} pour un cumul ligne à
+ligne.
+\item \textbf{Indicateurs} : DPD, PAR, ECL par stage avec \code{ROLLUP}, déciles et courbe de gains, AUC
+par les rangs, matrice de transition, générations observées assez longtemps.
+\end{enumerate}
+\end{resume}
+
+\begin{entretien}
+\begin{itemize}
+\item « Le retard est calculé dans une vue unique, \code{v_situation_prets} : toutes les analyses
+utilisent la même règle, celle de l'article 178 du CRR. »
+\item « Les provisions IFRS~9 tiennent en une requête de trois CTE : 25,6 millions d'euros, dont 96,5~\%
+en stage 3. Le \code{ROLLUP} donne le total, et un contrôle vérifie qu'aucun prêt n'est sans score. »
+\item « J'ai calculé l'AUC directement en SQL par la statistique de Mann--Whitney, avec des rangs
+moyens pour les ex æquo : 0,923 pour le XGBoost contre 0,876 pour la logistique, sur l'échantillon
+test uniquement. »
+\item « Les déciles montrent à la fois la discrimination, 75~\% des défauts dans les deux premiers
+déciles, et la calibration : la PD prédite suit le taux observé. »
+\end{itemize}
+\end{entretien}
+
+\subsection*{Questions fréquentes en entretien}
+
+\begin{description}[leftmargin=0pt, itemsep=0.5em]
+\item[Différence entre WHERE et HAVING ?] \code{WHERE} filtre les lignes avant le regroupement,
+\code{HAVING} filtre les groupes après.
+\item[RANK, DENSE\_RANK, ROW\_NUMBER ?] Voir le tableau des rangs : le traitement des ex æquo les
+distingue.
+\item[Comment obtenir le 2\textsuperscript{e} plus gros prêt de chaque client ?]
+\code{DENSE_RANK() OVER (PARTITION BY client_id ORDER BY montant DESC)} dans une CTE, puis
+\code{WHERE rang = 2}.
+\item[Comment calculer une évolution d'un mois sur l'autre ?] \code{LAG(valeur) OVER (ORDER BY mois)},
+puis \code{valeur / LAG(...) - 1}.
+\item[Une CTE est-elle plus rapide qu'une sous-requête ?] Pas en soi : depuis PostgreSQL 12, elles sont
+généralement optimisées de la même façon. La CTE gagne en lisibilité.
+\end{description}

@@ -1,0 +1,7 @@
+# Dépendances du chargeur python/charger_donnees.py
+# Installation : python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+numpy>=1.26
+pandas>=2.2
+Faker>=24.0
+SQLAlchemy>=2.0
+psycopg[binary]>=3.1

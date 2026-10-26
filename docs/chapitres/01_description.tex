@@ -1,0 +1,324 @@
+% =============================================================================
+% Partie 1 — Description du projet
+% =============================================================================
+\chapter{Description du projet}
+
+\epigraphe{Une banque ne gagne pas d'argent en prêtant : elle en gagne quand on la rembourse.}
+
+Avant d'écrire la moindre ligne de SQL, il faut comprendre \textbf{à quoi sert} le système que tu vas
+construire, \textbf{pour qui}, et \textbf{pourquoi} il doit être aussi rigoureux. Cette partie pose le
+décor : le métier du risque de crédit, le rôle de la base de données dans une banque, et la place
+des modèles de Machine Learning.
+
+% -----------------------------------------------------------------------------
+\section{Le titre du projet}
+
+\begin{situation}{Mise en situation --- Ton premier jour dans l'équipe Risque}
+Tu commences ton stage dans une banque en ligne qui accorde des prêts à la consommation. Aujourd'hui,
+tout est éparpillé : les dossiers de prêt dans un tableur, les paiements dans un export comptable, et
+les scores du modèle de Machine Learning dans le notebook d'une data scientist.
+
+Ta responsable te dit : \emph{« Le régulateur nous demande de justifier chaque provision, le comité
+des risques veut savoir chaque matin combien de prêts sont en retard, et personne ne sait quelle
+version du modèle a décidé de quel prêt. Il nous faut une vraie base de données. »}
+
+Ta mission : construire cette base, de la première table jusqu'à la détection automatique du défaut.
+\end{situation}
+
+Le titre officiel de ton projet est :
+\begin{center}
+\textbf{\large Un système backend SQL d'entreprise orienté Risk Analytics,\\Scoring de Crédit et MLOps
+(Fintech / Banque)}
+\end{center}
+
+Chaque mot de ce titre correspond à une exigence précise :
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}B{3.6cm} L@{}}
+\toprule
+Système backend SQL & la base PostgreSQL et toute sa logique : tables, contraintes, vues, fonctions,
+triggers, procédures. Pas d'interface graphique : c'est le moteur que d'autres applications utilisent. \\
+d'entreprise & des données qui ne peuvent pas être fausses (contraintes), des opérations « tout ou
+rien » (transactions), une trace de chaque changement (audit), des droits d'accès (sécurité) et des
+temps de réponse corrects sur des millions de lignes (index). \\
+Risk Analytics & mesurer le risque du portefeuille : retards, prêts en défaut, pertes attendues,
+provisions. \\
+Scoring de crédit & prédire, avant d'accorder un prêt, la probabilité que l'emprunteur ne rembourse pas. \\
+MLOps & faire vivre les modèles en production : savoir quelle version a décidé quoi, conserver chaque
+prédiction, comparer le modèle en place à ses concurrents, détecter qu'il se dégrade. \\
+Fintech / Banque & un secteur réglementé : chaque chiffre doit pouvoir être justifié devant un
+auditeur ou un superviseur. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+% -----------------------------------------------------------------------------
+\section{Contexte et enjeux métier}
+
+\subsection{Le métier : prêter de l'argent qu'on n'a pas encore récupéré}
+
+\begin{imagine}
+Tu prêtes 100~€ à chacun de tes 10 amis. Tu sais d'expérience qu'en moyenne \textbf{un sur dix} ne te
+rembourse pas. Et quand quelqu'un ne rembourse pas, tu finis quand même par récupérer un peu plus de la
+moitié de la somme : tu perds \textbf{45~\%} de ce qu'il te doit.
+
+\textbf{Combien t'attends-tu à perdre ?} Sur 10 amis, environ 1 ne rembourse pas. Il te devait 100~€, tu
+en perds 45~\%. Ta perte attendue est donc d'environ $10 \times 10~\% \times 45~\% \times 100~€ = 45~€$.
+
+Tu viens de faire, sans le savoir, le calcul central du risque de crédit.
+\end{imagine}
+
+Une banque fait exactement la même chose, mais avec des milliers de clients, des prêts qui durent des
+années et une obligation légale de mesurer ce risque correctement. Trois grandeurs suffisent à le
+décrire.
+
+\begin{definition}{Les trois paramètres du risque de crédit}
+\begin{itemize}
+\item \textbf{PD} (\emph{Probability of Default}, probabilité de défaut) : la probabilité que
+l'emprunteur fasse défaut. C'est ce que prédit ton modèle de scoring.
+\item \textbf{LGD} (\emph{Loss Given Default}, perte en cas de défaut) : la part de la somme due que la
+banque perd réellement si le client fait défaut, après recouvrement. Dans ce projet : \textbf{45~\%}, la
+valeur réglementaire de référence pour une créance non garantie.
+\item \textbf{EAD} (\emph{Exposure At Default}, exposition au moment du défaut) : la somme que le client
+doit encore au moment où il fait défaut. Pour un prêt amortissable, c'est le \textbf{capital restant
+dû} : il baisse à chaque mensualité payée.
+\end{itemize}
+\end{definition}
+
+Leur produit donne la \textbf{perte attendue} (\emph{Expected Loss}) :
+\[
+\boxed{\;EL = PD \times LGD \times EAD\;}
+\]
+
+\begin{calcul}{la perte attendue d'un prêt}
+Un client emprunte 10\,000~€. Ton modèle estime sa probabilité de défaut à 5~\%. La LGD vaut 45~\%.
+\begin{enumerate}
+\item EAD : au départ, le client doit tout le capital, soit \textbf{10\,000~€}.
+\item Perte si défaut : $45~\% \times 10\,000 = 4\,500$~€.
+\item Perte attendue : $5~\% \times 4\,500 = \mathbf{225~€}$.
+\end{enumerate}
+Ces 225~€ ne sont pas une perte certaine : c'est la perte \textbf{moyenne} sur un grand nombre de prêts
+semblables. La banque doit la couvrir par le taux d'intérêt qu'elle facture et par des provisions.
+\end{calcul}
+
+\subsection{Les trois questions de l'équipe Risque}
+
+Tout le travail d'une équipe Risque de crédit répond à trois questions, posées à trois moments de la vie
+d'un prêt. Ton projet apporte une réponse SQL à chacune.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}B{3.9cm} P{2.6cm} L@{}}
+\toprule
+Question & Moment & Réponse dans ton projet \\
+\midrule
+Qui \emph{va} faire défaut ? & avant l'octroi & le \textbf{score} du modèle (PD), stocké dans
+\code{predictions_scoring_ml} avec son explication SHAP. \\
+Qui \emph{est en train} de faire défaut ? & pendant la vie du prêt & le \textbf{retard de paiement} (DPD),
+calculé à partir de \code{echeancier_remboursements}. \\
+Combien allons-nous perdre ? & chaque fin de mois & l'\textbf{exposition} (EAD) et les
+\textbf{provisions} (ECL), calculées et historisées dans \code{provisions_mensuelles}. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{Le cadre réglementaire, en deux idées}
+
+Tu n'as pas besoin d'être juriste, mais deux textes structurent tout le projet. Les citer correctement en
+entretien fait une vraie différence.
+
+\begin{definition}{Le défaut (règlement européen CRR, article 178)}
+Un emprunteur est \textbf{en défaut} lorsqu'il a un retard de paiement de \textbf{plus de 90 jours} sur
+une obligation significative, ou lorsque la banque estime qu'il ne paiera probablement pas
+(\emph{unlikeliness to pay}). C'est la règle que ton trigger appliquera automatiquement.
+\end{definition}
+
+\begin{definition}{Les provisions IFRS 9}
+Depuis 2018, la norme comptable IFRS~9 oblige les banques à provisionner les \textbf{pertes attendues}
+(\emph{Expected Credit Loss}, ECL) \textbf{dès l'octroi} du prêt, sans attendre l'incident. Chaque prêt
+est classé dans l'un de trois \textbf{stages} :
+\begin{itemize}
+\item \textbf{Stage 1} : prêt sain. On provisionne la perte attendue sur les \textbf{12 prochains mois}.
+\item \textbf{Stage 2} : risque significativement dégradé, présumé à partir de \textbf{plus de 30 jours}
+de retard. On provisionne la perte attendue sur \textbf{toute la durée restante}.
+\item \textbf{Stage 3} : prêt en défaut. La perte est considérée comme avérée : $PD = 100~\%$.
+\end{itemize}
+\end{definition}
+
+\begin{observation}[Pourquoi c'est un sujet SQL]
+Le superviseur et les auditeurs peuvent demander, des mois plus tard : \emph{« Pourquoi avez-vous
+provisionné 57,21~€ sur le prêt 61 au 30 septembre ? »}. Il faut alors retrouver la donnée utilisée,
+la règle appliquée et la date du calcul. Un tableur modifié à la main en est incapable. Une base de
+données bien conçue, avec ses contraintes, son historique et ses calculs rejouables, le permet.
+\end{observation}
+
+\subsection{Où intervient le Machine Learning}
+
+Ton projet de scoring a produit trois modèles, entraînés en R sur l'historique des prêts : une
+\textbf{grille de score} (des points par caractéristique), une \textbf{régression logistique}, et un
+\textbf{XGBoost monotone}. Sur l'échantillon de test, le XGBoost atteint une AUC de \textbf{0,923},
+contre 0,876 pour la logistique : c'est lui qui décide en production. On l'appelle le
+\textbf{modèle champion} ; les deux autres sont des \textbf{challengers}.
+
+\begin{definition}{SHAP}
+Les valeurs SHAP (\emph{SHapley Additive exPlanations}) décomposent une prédiction en
+\textbf{contributions de chaque variable}. Pour un prêt donné, une valeur positive pousse le risque
+vers le haut, une valeur négative le fait baisser. Ta base conserve, pour chaque prédiction du
+champion, la variable qui a le plus pesé et sa contribution.
+\end{definition}
+
+Par exemple, pour le prêt 61, le XGBoost prédit une PD de 1,07~\% et la variable la plus influente est
+la \code{note_risque}, avec une contribution de $-1{,}29$ : sa bonne note (A) a fortement fait baisser
+le risque estimé. Cette explication est indispensable : le RGPD encadre les décisions automatisées, et
+les orientations de l'Autorité bancaire européenne sur l'octroi de prêts exigent des modèles
+explicables. Une banque doit pouvoir dire à un client \emph{pourquoi} son prêt a été refusé.
+
+La base de données est le point de rencontre entre le monde des modèles et celui du métier. La
+figure~\ref{fig:boucle-mlops} montre ce cycle, que l'on appelle souvent la \textbf{boucle MLOps}.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[font=\small, >=Stealth,
+  etape/.style={draw=bleuML, fill=bleuFond, rounded corners=3pt, minimum width=3.3cm, minimum height=1cm,
+                align=center, line width=0.6pt}]
+  \node[cylinder, shape border rotate=90, aspect=0.2, draw=bleuML, fill=white, line width=0.9pt,
+        minimum width=2.6cm, minimum height=1.7cm, align=center] (db) at (0,0) {\textbf{Base}\\\textbf{PostgreSQL}};
+  \node[etape] (a) at (90:3.1)  {\textbf{1.} Données d'historique\\{\footnotesize clients, prêts, défauts}};
+  \node[etape] (b) at (30:3.6)  {\textbf{2.} Entraînement\\{\footnotesize R / Python, XGBoost}};
+  \node[etape] (c) at (-30:3.6) {\textbf{3.} Prédiction\\{\footnotesize PD + explication SHAP}};
+  \node[etape] (d) at (-90:3.1) {\textbf{4.} Décision et suivi\\{\footnotesize échéancier, paiements}};
+  \node[etape] (e) at (-150:3.6){\textbf{5.} Vérité observée\\{\footnotesize défaut ou non}};
+  \node[etape] (f) at (150:3.6) {\textbf{6.} Monitoring\\{\footnotesize AUC, déciles, champion}};
+  \draw[->, thick, bleuML] (a) to[bend left=12] (b);
+  \draw[->, thick, bleuML] (b) to[bend left=12] (c);
+  \draw[->, thick, bleuML] (c) to[bend left=12] (d);
+  \draw[->, thick, bleuML] (d) to[bend left=12] (e);
+  \draw[->, thick, bleuML] (e) to[bend left=12] (f);
+  \draw[->, thick, bleuML] (f) to[bend left=12] (a);
+  \foreach \n in {a,c,d,e,f} \draw[densely dotted, grisTitre] (db) -- (\n);
+\end{tikzpicture}
+\caption{La boucle MLOps : la base fournit les données d'entraînement, conserve chaque prédiction,
+enregistre ce qui se passe réellement, puis permet de mesurer la performance du modèle.}
+\label{fig:boucle-mlops}
+\end{figure}
+
+\begin{analogie}{le carnet de santé}
+Pense au prêt comme à un patient. Le \textbf{modèle de scoring} est le médecin qui fait un pronostic à
+l'entrée. La \textbf{base de données} est le carnet de santé : on y note le pronostic, qui l'a fait et
+quand, puis chaque examen (chaque mensualité). Le \textbf{suivi du retard} est la prise de température
+régulière, et le \textbf{trigger} est l'alarme qui se déclenche quand la fièvre dépasse un seuil. Sans
+carnet, impossible de savoir, des années plus tard, si le médecin avait vu juste.
+\end{analogie}
+
+\subsection{Pourquoi ce projet existe en entreprise}
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}B{3.1cm} L L@{}}
+\toprule
+Besoin & Avec des fichiers et un notebook & Avec ton système SQL \\
+\midrule
+Données fiables & un âge de 15 ans ou un paiement en double passent inaperçus & les contraintes les
+refusent à l'entrée \\
+Source unique & chacun a « sa » version du fichier & une seule base, partagée \\
+Traçabilité & on ne sait plus quel modèle a décidé & chaque prédiction est conservée avec sa version \\
+Détection du défaut & quelqu'un doit y penser & un trigger et un traitement de nuit l'appliquent \\
+Provisions & recalculées à la main, non reproductibles & une procédure rejouable, historisée chaque mois \\
+Volume & le tableur sature vers un million de lignes & 1,1 million de mensualités interrogées en
+quelques millisecondes grâce aux index \\
+Sécurité & le fichier circule par e-mail & des rôles : l'analyste lit, l'application encaisse \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+% -----------------------------------------------------------------------------
+\section{Cas d'usage concret : la vie d'un prêt}
+
+\begin{situation}{Le dossier d'Awa Koné}
+Awa Koné, 29 ans, locataire, 42\,000~€ de revenus annuels, demande \textbf{12\,000~€ sur 36 mois} au
+taux de 9,5~\% pour financer ses études. Suivons son prêt de la demande jusqu'au défaut éventuel, et
+regardons ce que fait la base à chaque étape.
+\end{situation}
+
+\begin{enumerate}[leftmargin=1.6em, itemsep=0.45em]
+\item \textbf{La demande (20/09/2026).} Une fiche client et un dossier de prêt sont créés. Les contraintes
+vérifient tout de suite que l'âge est plausible, que le montant est positif, que le motif fait partie
+de la liste autorisée.
+\item \textbf{Le scoring (24/09/2026).} Le XGBoost estime sa probabilité de défaut à \textbf{11,8~\%}. Le
+seuil de décision du modèle est 25,5~\% : le prêt est \textbf{accordé}. L'explication SHAP indique que
+la variable la plus influente est le \textbf{taux d'effort} (le montant emprunté rapporté au revenu,
+ici $12\,000 / 42\,000 \approx 29~\%$), qui augmente le risque. La prédiction est enregistrée avec la
+version du modèle, le seuil et la date.
+\item \textbf{L'octroi et l'échéancier (25/09/2026).} La base génère \textbf{36 mensualités de
+384,40~€} à partir du 25/10/2026. Le coût total du crédit est de 1\,838,21~€ d'intérêts.
+\item \textbf{Le suivi.} Chaque paiement est enregistré par une procédure qui l'affecte à la mensualité la
+plus ancienne restant due. Le retard (DPD) se déduit des dates : il n'est jamais saisi à la main.
+\item \textbf{Le retard.} Si la mensualité du 25/10/2026 n'est pas payée, Awa est \textbf{en retard} dès
+le lendemain. Au-delà de 30 jours, son prêt passe en \textbf{stage 2} et la provision augmente.
+\item \textbf{Le défaut.} Toujours sans paiement, au 31/01/2027 son retard atteint \textbf{98 jours} :
+plus de 90 jours, le prêt passe \textbf{en défaut}. Le changement est inscrit dans un journal d'audit,
+une alerte est envoyée, et la provision est calculée avec une PD de 100~\%.
+\item \textbf{La fin.} Si tout est remboursé, le prêt est \textbf{soldé}. S'il est en défaut, il ne
+redevient pas sain automatiquement : une période probatoire et une décision humaine sont nécessaires.
+\end{enumerate}
+
+Ces changements d'état forment le cycle de vie du prêt (figure~\ref{fig:cycle-vie}). Tu
+l'implémenteras au chapitre~3.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[font=\small, >=Stealth, node distance=1.2cm,
+  etat/.style={draw, rounded corners=8pt, minimum width=2.25cm, minimum height=0.85cm, line width=0.7pt, align=center}]
+  \node[etat, draw=grisTitre, fill=grisFond] (att) at (0,0) {en attente};
+  \node[etat, draw=grisTitre, fill=grisFond] (ref) at (0,-2.6) {refusé};
+  \node[etat, draw=vertCadre, fill=vertFond] (sain) at (3.6,0) {sain};
+  \node[etat, draw=orangeEx, fill=orangeFond] (ret) at (7.6,0) {en retard};
+  \node[etat, draw=rouge, fill=rougeFond] (def) at (12.1,0) {en défaut};
+  \node[etat, draw=bleuML, fill=bleuFond] (sol) at (7.6,-2.6) {soldé};
+  \draw[->, thick] (att) -- node[left, font=\footnotesize, align=right] {PD $\geq$ seuil} (ref);
+  \draw[->, thick] (att) -- node[above, font=\footnotesize] {accordé} (sain);
+  \draw[->, thick] (sain) to[bend left=28] node[above=1pt, font=\footnotesize] {DPD $> 0$} (ret);
+  \draw[->, thick] (ret) to[bend left=28] node[below=1pt, font=\footnotesize] {régularisation} (sain);
+  \draw[->, thick, rouge] (ret) -- node[above, font=\footnotesize] {DPD $> 90$} (def);
+  \draw[->, thick, dashed, grisTexte] (def) to[bend right=40] node[above=1pt, font=\footnotesize, align=center]
+      {période probatoire + décision humaine} (sain);
+  \draw[->, thick] (sain) |- node[pos=0.75, below, font=\footnotesize] {reste dû $= 0$} (sol);
+  \draw[->, thick] (ret) -- node[right, font=\footnotesize] {reste dû $= 0$} (sol);
+  \draw[->, thick, dashed, grisTexte] (def) |- node[pos=0.75, below, font=\footnotesize] {recouvrement} (sol);
+\end{tikzpicture}
+\caption{Le cycle de vie d'un prêt. Les flèches pleines sont automatiques (trigger ou traitement de
+nuit) ; les flèches en pointillés demandent une décision humaine.}
+\label{fig:cycle-vie}
+\end{figure}
+
+Le tableau suivant relie chaque étape aux tables et aux mécanismes SQL que tu vas construire.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}B{2.6cm} P{4.3cm} L P{1.5cm}@{}}
+\toprule
+Étape & Tables & Mécanisme SQL & Où \\
+\midrule
+Demande & \code{clients}, \code{demandes_pret} & contraintes \code{CHECK}, clés, transaction & Ch.~1 \\
+Scoring & \code{predictions_scoring_ml} & registre versionné, contrainte de cohérence & Ch.~1 \\
+Échéancier & \code{echeancier_remboursements} & \code{generate_series}, CTE, formule d'annuité & Ch.~1 \\
+Suivi du retard & vue \code{v_situation_prets} & agrégats, \code{FILTER}, fonctions de dates & Ch.~2 \\
+Provisions & \code{provisions_mensuelles} & CTE, \code{ROLLUP}, procédure rejouable & Ch.~2 et 3 \\
+Paiement & \code{echeancier_remboursements} & procédure stockée, verrou & Ch.~3 \\
+Défaut & \code{demandes_pret}, \code{journal_statuts} & triggers, traitement de nuit, \code{pg_notify} & Ch.~3 \\
+Monitoring & \code{predictions_scoring_ml}, \code{echantillons_modele} & \code{NTILE}, rangs, AUC en SQL & Ch.~2 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{resume}
+\begin{enumerate}
+\item Le risque de crédit se résume par $EL = PD \times LGD \times EAD$ : probabilité de défaut, perte
+en cas de défaut, exposition.
+\item L'équipe Risque répond à trois questions : qui \emph{va} faire défaut (scoring), qui \emph{est en
+train} de faire défaut (retards), combien allons-nous perdre (provisions).
+\item Deux règles structurent le projet : le \textbf{défaut} au-delà de 90 jours de retard (CRR,
+art.~178) et les \textbf{trois stages} de provisionnement IFRS~9 (seuil de 30 jours pour le stage 2).
+\item La base de données est le point de rencontre entre les modèles de ML et le métier : elle fournit
+les données, conserve chaque prédiction et permet de mesurer la performance des modèles.
+\item Le cas d'usage suit un prêt de la demande au défaut : chaque étape correspond à une table et à un
+mécanisme SQL du cours.
+\end{enumerate}
+\end{resume}

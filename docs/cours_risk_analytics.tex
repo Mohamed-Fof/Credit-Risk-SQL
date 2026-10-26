@@ -1,0 +1,192 @@
+% =============================================================================
+% Cours — Risk Analytics & Scoring de Crédit : un système backend SQL d'entreprise
+% Compilation (depuis le dossier docs/) : latexmk -xelatex cours_risk_analytics.tex
+% Tous les résultats cités ont été obtenus en exécutant le projet (PostgreSQL 17,
+% données du dossier donnees/, date de référence 30/09/2026).
+% =============================================================================
+\documentclass[11pt,a4paper,openany]{report}
+
+% ---------------------------------------------------------------- Polices et langue
+\usepackage{fontspec}
+% Police principale : Latin Modern (celle de fontspec par défaut, comme le cours de ML)
+\setmonofont{Menlo}[Scale=0.78]
+\usepackage[french]{babel}
+\usepackage[top=2.5cm,bottom=2.4cm,left=2.5cm,right=2.5cm,headheight=15pt]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage[locale=FR, group-minimum-digits=4]{siunitx}
+
+% ---------------------------------------------------------------- Mise en page
+\usepackage{booktabs,tabularx,array,multirow,colortbl}
+\usepackage[table]{xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage[most]{tcolorbox}
+\usepackage{titlesec}
+\usepackage{titletoc}
+\usepackage{fancyhdr}
+\usepackage{caption}
+\usepackage{needspace}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,shapes.multipart,calc,fit,backgrounds,
+                decorations.pathreplacing,matrix}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepgfplotslibrary{fillbetween}
+\usepackage[hypertexnames=false]{hyperref}
+
+% ---------------------------------------------------------------- Couleurs (reprises du cours de ML)
+\definecolor{bleuML}{HTML}{2962FF}
+\definecolor{bleuFond}{HTML}{EEF2FF}
+\definecolor{bleuCouv}{HTML}{EAF0FF}
+\definecolor{grisTitre}{HTML}{A9A9A9}
+\definecolor{grisFond}{HTML}{F3F3F3}
+\definecolor{grisTexte}{HTML}{5F6368}
+\definecolor{vertCadre}{HTML}{1E8449}
+\definecolor{vertTitre}{HTML}{D4EFDF}
+\definecolor{vertFond}{HTML}{F2FAF5}
+\definecolor{rouge}{HTML}{E53935}
+\definecolor{rougeFond}{HTML}{FDEEEE}
+\definecolor{orangeEx}{HTML}{FF9800}
+\definecolor{orangeFond}{HTML}{FFF6EA}
+\definecolor{violetCor}{HTML}{8E44AD}
+\definecolor{violetFond}{HTML}{F6EFFA}
+\definecolor{tealEnt}{HTML}{00838F}
+\definecolor{tealFond}{HTML}{E9F6F7}
+\definecolor{codeFond}{HTML}{F7F8FA}
+\definecolor{codeCadre}{HTML}{D0D4DA}
+\definecolor{motcle}{HTML}{1A4FC9}
+\definecolor{commentaire}{HTML}{2E7D32}
+\definecolor{chaine}{HTML}{B35C00}
+
+\hypersetup{colorlinks=true, linkcolor=bleuML, urlcolor=bleuML, citecolor=bleuML,
+  pdftitle={Risk Analytics et Scoring de Crédit — un système backend SQL d'entreprise},
+  pdfauthor={Mohamed Fofana}}
+
+% ---------------------------------------------------------------- Titres
+\newcommand{\nomchapitre}{Chapitre}
+\titleformat{\chapter}[display]{\normalfont\color{bleuML}}{\LARGE\nomchapitre~\thechapter}{14pt}{\Huge}
+\titleformat{name=\chapter,numberless}[display]{\normalfont\color{bleuML}}{}{0pt}{\Huge}
+\titlespacing*{\chapter}{0pt}{-12pt}{26pt}
+\titleformat{\section}{\normalfont\Large\bfseries}{\thesection}{0.9em}{}
+\titleformat{\subsection}{\normalfont\large\bfseries}{\thesubsection}{0.9em}{}
+\titleformat{\subsubsection}{\normalfont\normalsize\bfseries}{\thesubsubsection}{0.8em}{}
+\setcounter{secnumdepth}{3}
+\setcounter{tocdepth}{1}
+\newcommand{\epigraphe}[1]{\begin{quote}\itshape « #1 »\end{quote}\vspace{0.6em}}
+
+% Page de séparation de la partie « Modules de cours »
+\newcommand{\pagepartie}[3]{%
+  \clearpage\thispagestyle{empty}%
+  \vspace*{4.5cm}%
+  {\centering\color{bleuML}{\LARGE Partie #1}\par\vspace{0.5cm}{\Huge #2}\par\vspace{0.9cm}%
+   {\color{bleuML!50}\rule{0.55\linewidth}{0.8pt}}\par\vspace{0.9cm}}%
+  \begin{center}\begin{minipage}{0.78\linewidth}\large #3\end{minipage}\end{center}%
+  \addcontentsline{toc}{part}{Partie #1 — #2}%
+  \clearpage}
+
+% ---------------------------------------------------------------- En-têtes
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\leftmark}
+\fancyhead[R]{\small Projet SQL — Risk Analytics}
+\fancyfoot[C]{\small\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\chaptermark}[1]{\markboth{\nomchapitre~\thechapter.~#1}{}}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\small\thepage}\renewcommand{\headrulewidth}{0pt}}
+
+\setlength{\parindent}{1.2em}
+\setlength{\parskip}{0.35em}
+\setlength{\emergencystretch}{2.5em}
+\frenchsetup{ItemLabels=\textemdash}
+\setlist{itemsep=0.2em, topsep=0.35em}
+\captionsetup{font=small, labelfont=sc, labelsep=endash}
+\renewcommand{\arraystretch}{1.15}
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+\newcolumntype{P}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{B}[1]{>{\raggedright\arraybackslash\bfseries}p{#1}}
+
+% ---------------------------------------------------------------- Encadrés (style du cours de ML)
+\tcbset{base/.style={enhanced, breakable, boxrule=0.6pt, arc=2pt, left=7pt, right=7pt, top=5pt,
+  bottom=5pt, fonttitle=\bfseries, coltitle=white, before skip=9pt, after skip=9pt,
+  parbox=false, before upper={\setlength{\parindent}{0pt}\setlength{\parskip}{0.35em}
+\setlength{\emergencystretch}{2.5em}}}}
+\newtcolorbox{imagine}[1][Imagine cette situation\dots]{base, colback=grisFond, colframe=grisTitre, title={#1}}
+\newtcolorbox{analogie}[1]{base, colback=grisFond, colframe=grisTitre, title={Analogie — #1}}
+\newtcolorbox{observation}[1][Observation]{base, colback=grisFond, colframe=grisTitre, title={#1}}
+\newtcolorbox{definition}[1]{base, colback=bleuFond, colframe=bleuML, title={Définition — #1}}
+\newtcolorbox{regle}[1][Règle d'or]{base, colback=bleuFond, colframe=bleuML, title={#1}}
+\newtcolorbox{situation}[1]{base, colback=vertFond, colframe=vertCadre, colbacktitle=vertTitre,
+  coltitle=black, fonttitle=\large\bfseries, title={#1}}
+\newtcolorbox{calcul}[1]{base, colback=white, colframe=vertCadre, colbacktitle=vertTitre, coltitle=black,
+  title={Calcul à la main — #1}}
+\newtcolorbox{piege}[1]{base, colback=rougeFond, colframe=rouge, title={#1}}
+\newtcolorbox{resume}[1][Résumé du chapitre]{base, colback=rougeFond, colframe=rouge, title={#1}}
+\newtcolorbox{exercice}[2]{base, colback=orangeFond, colframe=orangeEx, title={Exercice #1 — #2}}
+\newtcolorbox{indice}[1][Indices]{base, colback=white, colframe=orangeEx!70, colbacktitle=orangeFond,
+  coltitle=black, title={#1}}
+\newtcolorbox{correction}[1]{base, colback=violetFond, colframe=violetCor, title={Correction de l'exercice #1}}
+\newtcolorbox{resultat}[1][Ce que tu dois obtenir]{base, colback=white, colframe=bleuML!55,
+  colbacktitle=bleuFond, coltitle=black, title={#1}}
+\newtcolorbox{entretien}[1][Ce que tu sauras dire en entretien]{base, colback=tealFond, colframe=tealEnt, title={#1}}
+
+% ---------------------------------------------------------------- Code
+\lstdefinelanguage{pgsql}[]{SQL}{
+  morekeywords={RETURNING,FILTER,OVER,PARTITION,WINDOW,ROWS,RANGE,PRECEDING,FOLLOWING,UNBOUNDED,
+    CURRENT,ROW,ROLLUP,CUBE,GROUPING,LATERAL,WITH,RECURSIVE,MATERIALIZED,IDENTITY,GENERATED,ALWAYS,
+    DEFAULT,REFERENCES,RESTRICT,CASCADE,CONSTRAINT,CHECK,UNIQUE,PRIMARY,KEY,FOREIGN,INDEX,IF,EXISTS,
+    BOOLEAN,NUMERIC,SMALLINT,INTEGER,BIGINT,VARCHAR,TEXT,DATE,TIMESTAMP,INTERVAL,CHAR,TRUNCATE,BEGIN,
+    COMMIT,ROLLBACK,FUNCTION,PROCEDURE,TRIGGER,RETURNS,RETURN,LANGUAGE,DECLARE,RAISE,EXCEPTION,
+    NOTICE,PERFORM,LOOP,EXIT,ELSIF,EACH,STATEMENT,EXECUTE,BEFORE,AFTER,NEW,OLD,REFERENCING,CALL,DO,
+    STABLE,IMMUTABLE,VOLATILE,STRICT,INTO,FOUND,GET,DIAGNOSTICS,ROW_COUNT,CONFLICT,NOTHING,EXCLUDED,
+    GRANT,REVOKE,ROLE,SECURITY,DEFINER,NOLOGIN,NTILE,LAG,LEAD,RANK,DENSE_RANK,ROW_NUMBER,COALESCE,
+    GREATEST,LEAST,REPLACE,ANALYZE,EXPLAIN,COPY,STDIN,CROSS,USING,BETWEEN,TRUE,FALSE,DISTINCT,
+    QUERY,TABLE,OUT,RECORD,SETOF,NULLS,FIRST,LAST,MONTH,QUARTER,INOUT,TEMP,ILIKE,SESSION_USER},
+  sensitive=false, morecomment=[l]{--}, morestring=[b]'}
+\lstset{basicstyle=\ttfamily\small, backgroundcolor=\color{codeFond}, frame=single, rulecolor=\color{codeCadre},
+  framesep=5pt, xleftmargin=6pt, xrightmargin=6pt, breaklines=true, breakatwhitespace=false,
+  postbreak=\mbox{\textcolor{grisTitre}{$\hookrightarrow$}\space}, columns=fullflexible, keepspaces=true,
+  keywordstyle=\color{motcle}\bfseries, commentstyle=\color{commentaire}\itshape,
+  stringstyle=\color{chaine}, showstringspaces=false, upquote=true, tabsize=4, aboveskip=6pt,
+  belowskip=6pt}
+\lstdefinestyle{sql}{language=pgsql}
+\lstdefinestyle{long}{language=pgsql, basicstyle=\ttfamily\scriptsize}
+\lstdefinestyle{py}{language=Python, basicstyle=\ttfamily\footnotesize,
+  morekeywords={as,with,None,True,False}}
+\lstdefinestyle{sortie}{language={}, basicstyle=\ttfamily\footnotesize, backgroundcolor=\color{white},
+  frame=lines, keywordstyle={}, commentstyle={}, stringstyle={}}
+\lstdefinestyle{shell}{language=bash, basicstyle=\ttfamily\small, keywordstyle=\color{motcle},
+  morekeywords={psql,createdb,dropdb,brew,pip,python,git,export,cd}}
+
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\tache}{\item[$\square$]}
+\newcommand{\ok}{\textcolor{vertCadre}{\checkmark}}
+
+% =============================================================================
+\begin{document}
+
+\input{chapitres/00_couverture}
+\input{chapitres/01_description}
+\input{chapitres/02_problematique}
+\input{chapitres/03_architecture}
+
+\pagepartie{4}{Modules de cours}{Trois chapitres progressifs. Chacun suit le même plan :
+\textbf{1.}~cours et notions importantes, avec les pièges à éviter ; \textbf{2.}~exercices guidés,
+corrigés pas à pas ; \textbf{3.}~exercices à faire seul (corrigés à la fin du cours) ;
+\textbf{4.}~synthèse pour les entretiens.\par\medskip
+Chaque requête a été exécutée sur ta base : les résultats affichés sont ceux que tu dois retrouver.}
+\renewcommand{\nomchapitre}{Chapitre}
+\setcounter{chapter}{0}
+\input{chapitres/04_chapitre1}
+\input{chapitres/05_chapitre2}
+\input{chapitres/06_chapitre3}
+
+\renewcommand{\nomchapitre}{Partie}
+\setcounter{chapter}{4}
+\input{chapitres/07_feuille_de_route}
+\input{chapitres/08_corriges}
+
+\appendix
+\renewcommand{\nomchapitre}{Annexe}
+\input{chapitres/09_annexes}
+
+\end{document}

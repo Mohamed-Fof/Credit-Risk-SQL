@@ -1,0 +1,629 @@
+% =============================================================================
+% Corrigés des exercices à faire seul
+% =============================================================================
+\chapter*{Corrigés des exercices à faire seul}
+\addcontentsline{toc}{chapter}{Corrigés des exercices à faire seul}
+\markboth{Corrigés des exercices à faire seul}{}
+
+\epigraphe{Un corrigé ne sert qu'à celui qui a d'abord cherché.}
+
+Tu trouveras ici le code, l'explication et les résultats de chaque exercice à faire seul. Les mêmes
+corrigés, exécutables, sont dans le dossier \code{corriges/}. Si ton résultat diffère, ne corrige pas
+ta requête pour « tomber juste » : cherche d'abord \emph{pourquoi} les deux diffèrent.
+
+% =============================================================================
+\section*{Chapitre 1}
+\addcontentsline{toc}{section}{Chapitre 1}
+
+\begin{correction}{1.3}
+\textbf{Le journal.} L'ancien statut peut être NULL (premier statut d'un prêt). Avec
+\code{CHECK (ancien_statut <> nouveau_statut)}, la ligne \code{(NULL, 'en_defaut')} serait acceptée,
+mais par accident : la comparaison vaut NULL, et un \code{CHECK} laisse passer NULL.
+\code{IS DISTINCT FROM} traite NULL comme une valeur ordinaire : \code{(NULL, 'en_defaut')} est acceptée
+parce que les deux valeurs diffèrent vraiment, \code{('sain', 'sain')} est refusée. L'intention est
+explicite, et la règle resterait juste si \code{nouveau_statut} devenait facultatif. Les valeurs par
+défaut remplissent l'horodatage et l'utilisateur sans que les triggers aient à s'en occuper. Le journal
+est consulté prêt par prêt : on indexe la clé étrangère.
+
+\textbf{Les provisions.} La clé primaire composite \code{(date_arrete, pret_id)} garantit « une ligne par
+prêt et par arrêté » ; elle sert aussi de cible à \code{ON CONFLICT} dans la clôture rejouable
+(exercice 3.5). Toutes les colonnes sont \code{NOT NULL} : une provision incomplète n'a pas de sens.
+
+\begin{lstlisting}[style=long]
+-- 1. Journal d'audit : chaque changement de statut d'un prêt, avec la date et l'ancien statut.
+CREATE TABLE IF NOT EXISTS journal_statuts (
+    journal_id      BIGINT       GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    pret_id         BIGINT       NOT NULL REFERENCES demandes_pret (pret_id) ON DELETE RESTRICT,
+    ancien_statut   VARCHAR(12),
+    nouveau_statut  VARCHAR(12)  NOT NULL,
+    jours_retard    INTEGER      CHECK (jours_retard >= 0),
+    date_effet      DATE         NOT NULL,
+    enregistre_le   TIMESTAMP    NOT NULL DEFAULT now(),
+    enregistre_par  TEXT         NOT NULL DEFAULT session_user,   -- l'utilisateur connecté (voir chapitre 3, sécurité)
+    CONSTRAINT statut_change CHECK (ancien_statut IS DISTINCT FROM nouveau_statut)
+);
+CREATE INDEX IF NOT EXISTS idx_journal_pret ON journal_statuts (pret_id);
+
+-- 2. Provisions mensuelles : une photographie du risque de chaque prêt à chaque arrêté.
+CREATE TABLE IF NOT EXISTS provisions_mensuelles (
+    date_arrete   DATE          NOT NULL,
+    pret_id       BIGINT        NOT NULL REFERENCES demandes_pret (pret_id) ON DELETE RESTRICT,
+    jours_retard  INTEGER       NOT NULL CHECK (jours_retard >= 0),
+    stage_ifrs9   SMALLINT      NOT NULL CHECK (stage_ifrs9 IN (1, 2, 3)),
+    ead           NUMERIC(12,2) NOT NULL CHECK (ead >= 0),
+    pd_utilisee   NUMERIC(7,6)  NOT NULL CHECK (pd_utilisee BETWEEN 0 AND 1),
+    lgd           NUMERIC(4,3)  NOT NULL CHECK (lgd BETWEEN 0 AND 1),
+    ecl           NUMERIC(12,2) NOT NULL CHECK (ecl >= 0),
+    PRIMARY KEY (date_arrete, pret_id)       -- un prêt, une ligne par arrêté
+);
+\end{lstlisting}
+
+\textbf{Pourquoi \code{RESTRICT} pour un journal ?} Un journal d'audit qui disparaîtrait avec le prêt
+n'aurait plus aucune valeur de preuve. \textbf{Pourquoi pas de clé étrangère vers une table de
+statuts ?} On aurait pu créer une petite table des statuts autorisés et la référencer ; ici, les
+contraintes \code{CHECK} de \code{demandes_pret} garantissent déjà que seuls des statuts valides y
+existent, et le journal ne fait que les recopier.
+\end{correction}
+
+\begin{correction}{1.4}
+\textbf{a) Les règles par prêt.} On agrège chaque prêt dans une CTE, puis on compte les prêts en
+anomalie. \code{IS DISTINCT FROM 0} attrape aussi un CRD final NULL (aucune échéance numéro $n$).
+\begin{lstlisting}[style=long]
+WITH par_pret AS (
+    SELECT p.pret_id, p.montant_demande, p.duree_mois,
+           sum(e.part_capital)                                                      AS capital_total,
+           count(*)                                                                 AS nb_echeances,
+           max(e.num_echeance)                                                      AS dernier_numero,
+           max(e.capital_restant_du) FILTER (WHERE e.num_echeance = p.duree_mois)   AS crd_final,
+           count(*) FILTER (WHERE e.montant_du <> e.part_capital + e.part_interets) AS montants_faux
+    FROM demandes_pret p
+    JOIN echeancier_remboursements e USING (pret_id)
+    WHERE p.statut_dossier = 'accorde'
+    GROUP BY p.pret_id
+)
+SELECT count(*)                                                                         AS prets_controles,
+       count(*) FILTER (WHERE capital_total <> montant_demande)                           AS capital_different,
+       count(*) FILTER (WHERE nb_echeances <> duree_mois OR dernier_numero <> duree_mois) AS echeances_manquantes,
+       count(*) FILTER (WHERE crd_final IS DISTINCT FROM 0)                               AS crd_final_non_nul,
+       sum(montants_faux)                                                                 AS montants_faux
+FROM par_pret;
+\end{lstlisting}
+
+\textbf{b) Les règles entre deux échéances : l'auto-jointure.} La table apparaît deux fois, sous deux
+alias : \code{prec} est l'échéance $k$, \code{suiv} l'échéance $k+1$ du même prêt. Grâce à l'index
+unique \code{(pret_id, num_echeance)}, la jointure est rapide (0,3 seconde).
+\begin{lstlisting}[style=long]
+SELECT count(*) FILTER (WHERE suiv.capital_restant_du <> prec.capital_restant_du - suiv.part_capital) AS ruptures_crd,
+       count(*) FILTER (WHERE suiv.date_echeance - prec.date_echeance NOT BETWEEN 28 AND 31)          AS ecarts_non_mensuels
+FROM echeancier_remboursements prec
+JOIN echeancier_remboursements suiv
+  ON suiv.pret_id = prec.pret_id AND suiv.num_echeance = prec.num_echeance + 1;
+\end{lstlisting}
+
+\textbf{c)} Une simple jointure avec un filtre :
+\begin{lstlisting}[style=long]
+SELECT count(*) AS paiements_avant_octroi
+FROM echeancier_remboursements e
+JOIN demandes_pret p USING (pret_id)
+WHERE e.date_paiement < p.date_decision;
+\end{lstlisting}
+
+\begin{resultat}
+32\,410 prêts contrôlés ; \textbf{0} anomalie dans chacune des sept règles.
+\end{resultat}
+
+\textbf{Une histoire vraie.} La première version du corrigé de l'exercice 1.1 arrondissait séparément
+les intérêts, le capital et le CRD. Ces contrôles ont trouvé \textbf{10 ruptures d'un centime}, toutes
+sur le prêt d'Awa : le CRD d'un mois ne valait plus exactement celui du mois précédent moins la part de
+capital. D'où la méthode actuelle (la part de capital est la différence de deux CRD arrondis). C'est
+exactement à cela que servent des contrôles automatiques : trouver les erreurs qu'aucune relecture ne
+voit.
+\end{correction}
+
+% =============================================================================
+\section*{Chapitre 2}
+\addcontentsline{toc}{section}{Chapitre 2}
+
+\begin{correction}{2.5}
+\begin{lstlisting}[style=long]
+WITH test AS (
+    SELECT ps.version_modele, ps.est_champion, ps.probabilite_defaut AS pd, ps.decision, s.en_defaut::int AS defaut
+    FROM predictions_scoring_ml ps
+    JOIN echantillons_modele em USING (pret_id)
+    JOIN v_situation_prets s   USING (pret_id)
+    WHERE em.echantillon = 'test'
+),
+rangs AS (
+    -- ex æquo : RANK() donne le premier rang du groupe ; on prend le rang moyen du groupe
+    SELECT *, RANK() OVER (PARTITION BY version_modele ORDER BY pd)
+              + (count(*) OVER (PARTITION BY version_modele, pd) - 1) / 2.0 AS rang
+    FROM test
+),
+mesures AS (
+    SELECT version_modele, est_champion,
+           (sum(rang) FILTER (WHERE defaut = 1) - sum(defaut) * (sum(defaut) + 1) / 2.0)
+             / (sum(defaut) * sum(1 - defaut))                                          AS auc,
+           100.0 * count(*) FILTER (WHERE decision = 'refuser' AND defaut = 1) / sum(defaut) AS rappel_pct,
+           100.0 * count(*) FILTER (WHERE decision = 'refuser') / count(*)                AS taux_refus_pct,
+           100.0 * count(*) FILTER (WHERE decision = 'accorder' AND defaut = 1)
+                 / count(*) FILTER (WHERE decision = 'accorder')                          AS defaut_parmi_accordes_pct
+    FROM rangs
+    GROUP BY version_modele, est_champion
+)
+SELECT version_modele, est_champion,
+       round(auc, 3)                     AS auc,
+       round(2 * auc - 1, 3)             AS gini,
+       round(rappel_pct, 1)              AS rappel_pct,
+       round(taux_refus_pct, 1)          AS taux_refus_pct,
+       round(defaut_parmi_accordes_pct, 1) AS defaut_parmi_accordes_pct
+FROM mesures
+ORDER BY auc DESC;
+\end{lstlisting}
+
+\textbf{Les points délicats.} Les deux fenêtres de \code{rangs} n'ont pas la même partition : la
+première classe les prêts d'un modèle, la seconde compte les ex æquo d'une même PD. Les \code{2.0}
+forcent des divisions décimales. \code{sum(1 - defaut)} compte les prêts sains.
+
+\begin{resultat}
+\begin{center}\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Modèle & AUC & Gini & Rappel & Refus & Défaut si accordé \\
+\midrule
+\code{xgboost_monotone_v2} (champion) & \textbf{0,923} & \textbf{0,847} & 76,4~\% & \textbf{21,9~\%} & \textbf{6,6~\%} \\
+\code{logistique_v1} & 0,876 & 0,751 & 77,8~\% & 29,5~\% & 6,9~\% \\
+\code{grille_score_v1} & 0,875 & 0,750 & 77,9~\% & 29,6~\% & 6,9~\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{resultat}
+
+\textbf{Le champion mérite-t-il sa place ?} Oui. Les challengers attrapent à peine plus de défauts
+(77,8~\% contre 76,4~\%), mais en refusant \textbf{7,6 points de clients de plus} (29,5~\% contre
+21,9~\%). Pour un risque un peu plus faible parmi les prêts accordés (6,6~\% contre 6,9~\%), le
+XGBoost accepte donc beaucoup plus de bons clients. Le seuil de chaque modèle est un arbitrage métier
+entre risque et volume : la base permet de le chiffrer.
+\end{correction}
+
+\begin{correction}{2.6}
+\begin{lstlisting}[style=long]
+WITH fins_de_mois AS (
+    SELECT (d + INTERVAL '1 month - 1 day')::date AS date_arrete
+    FROM generate_series(DATE '2025-09-01', DATE '2026-09-01', INTERVAL '1 month') AS d
+),
+-- Optimisation : ne garder que les échéances qui peuvent être impayées pendant la fenêtre
+-- (échues avant la dernière fin de mois, pas encore soldées à la première). Filtrer AVANT de joindre : 7 s → 3 s.
+impayes_possibles AS (
+    SELECT pret_id, date_echeance, date_paiement
+    FROM echeancier_remboursements
+    WHERE date_echeance <= (SELECT max(date_arrete) FROM fins_de_mois)
+      AND (date_paiement IS NULL OR date_paiement > (SELECT min(date_arrete) FROM fins_de_mois))
+),
+retards AS (
+    SELECT f.date_arrete, p.pret_id,
+           (p.date_premiere_echeance + (p.duree_mois - 1) * INTERVAL '1 month')::date AS fin_contrat,
+           coalesce(f.date_arrete - min(e.date_echeance), 0)                           AS jours_retard
+    FROM fins_de_mois f
+    JOIN demandes_pret p ON p.statut_dossier = 'accorde' AND p.date_decision <= f.date_arrete
+    -- LEFT JOIN : un prêt sans impayé n'a aucune ligne ici et garde un retard de 0
+    LEFT JOIN impayes_possibles e
+           ON e.pret_id = p.pret_id
+          AND e.date_echeance <= f.date_arrete
+          AND (e.date_paiement IS NULL OR e.date_paiement > f.date_arrete)
+    GROUP BY f.date_arrete, p.pret_id
+),
+tranches AS (
+    SELECT pret_id, date_arrete,
+           CASE WHEN jours_retard = 0  THEN '1. À jour'
+                WHEN jours_retard <= 30 THEN '2. 1 à 30 jours'
+                WHEN jours_retard <= 60 THEN '3. 31 à 60 jours'
+                WHEN jours_retard <= 90 THEN '4. 61 à 90 jours'
+                ELSE                         '5. Plus de 90 jours' END AS tranche
+    FROM retards
+    WHERE jours_retard > 0 OR fin_contrat > date_arrete      -- on écarte les prêts terminés et soldés
+),
+transitions AS (
+    SELECT tranche AS depart,
+           LEAD(tranche) OVER (PARTITION BY pret_id ORDER BY date_arrete) AS arrivee   -- tranche le mois suivant
+    FROM tranches
+)
+SELECT depart, count(*) AS nb_prets,
+       round(100.0 * count(*) FILTER (WHERE arrivee = '1. À jour')           / count(*), 1) AS vers_a_jour,
+       round(100.0 * count(*) FILTER (WHERE arrivee = '2. 1 à 30 jours')     / count(*), 1) AS vers_1_30,
+       round(100.0 * count(*) FILTER (WHERE arrivee = '3. 31 à 60 jours')    / count(*), 1) AS vers_31_60,
+       round(100.0 * count(*) FILTER (WHERE arrivee = '4. 61 à 90 jours')    / count(*), 1) AS vers_61_90,
+       round(100.0 * count(*) FILTER (WHERE arrivee = '5. Plus de 90 jours') / count(*), 1) AS vers_plus_90
+FROM transitions
+WHERE arrivee IS NOT NULL                                     -- dernier mois observé : pas de mois suivant
+GROUP BY depart
+ORDER BY depart;
+\end{lstlisting}
+
+\textbf{La logique.} On fabrique un « panel » (prêt $\times$ fin de mois), on y calcule le retard
+\emph{à cette date}, puis \code{LEAD} met côte à côte la tranche d'un mois et celle du mois suivant. Le
+\code{WHERE arrivee IS NOT NULL} écarte le dernier mois, qui n'a pas de suivant.
+
+\begin{resultat}[Ce que tu dois obtenir (en \% des prêts de la tranche de départ)]
+\begin{center}\small
+\newcommand{\hc}[1]{\cellcolor{rouge!#1}}
+\begin{tabular}{@{}lrccccc@{}}
+\toprule
+Départ $\backslash$ mois suivant & Prêts & À jour & 1--30 & 31--60 & 61--90 & $> 90$ \\
+\midrule
+1. À jour & 177\,587 & \hc{40}93,8 & \hc{6}6,1 & 0,1 & 0,0 & 0,0 \\
+2. 1 à 30 jours & 11\,674 & \hc{25}55,1 & \hc{3}5,3 & \hc{18}39,3 & 0,3 & 0,0 \\
+3. 31 à 60 jours & 4\,862 & \hc{18}38,5 & 2,9 & 1,7 & \hc{25}55,9 & 1,0 \\
+4. 61 à 90 jours & 2\,965 & \hc{4}7,7 & 1,1 & 0,3 & 0,7 & \hc{40}90,3 \\
+5. Plus de 90 jours & 68\,213 & 0,0 & 0,0 & 0,0 & 0,0 & \hc{45}100,0 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{resultat}
+
+\textbf{Lecture.} Un prêt à jour le reste à 93,8~\%. Un prêt à 1--30 jours qui ne régularise pas dans
+le mois passe mécaniquement à 31--60 (39,3~\%) : un mois de plus, c'est environ 30 jours de plus. Le
+point décisif est la tranche 61--90 : \textbf{90,3~\%} de ces prêts finissent en défaut le mois suivant.
+Le recouvrement doit donc agir dès 31--60 jours, quand 38,5~\% des prêts se régularisent encore. Enfin,
+la tranche « plus de 90 jours » est absorbante (100~\%) : dans ces données, aucun prêt en défaut n'a
+repris ses paiements.
+\end{correction}
+
+\begin{correction}{2.7}
+\begin{lstlisting}[style=long]
+WITH arrete AS (
+    SELECT max(valeur_date) FILTER (WHERE cle = 'date_reference')     AS date_ref,
+           max(valeur)      FILTER (WHERE cle = 'seuil_defaut_jours') AS seuil
+    FROM parametres_risque
+),
+entrees_defaut AS (
+    SELECT e.pret_id, min(e.date_echeance) + (a.seuil::int + 1) AS date_defaut
+    FROM echeancier_remboursements e
+    CROSS JOIN arrete a
+    WHERE e.date_echeance <= a.date_ref
+      AND coalesce(e.date_paiement, a.date_ref) - e.date_echeance > a.seuil
+    GROUP BY e.pret_id, a.seuil
+),
+prets AS (
+    SELECT p.pret_id, date_trunc('quarter', p.date_decision)::date AS generation,
+           p.date_decision, d.date_defaut, a.date_ref
+    FROM demandes_pret p
+    CROSS JOIN arrete a
+    LEFT JOIN entrees_defaut d USING (pret_id)
+    WHERE p.statut_dossier = 'accorde'
+),
+courbes AS (
+    SELECT g.generation, h.mois,
+           count(*)                                                                    AS nb_observes,
+           count(*) FILTER (WHERE g.date_defaut <= g.date_decision + h.mois * INTERVAL '1 month') AS nb_defauts
+    FROM prets g
+    CROSS JOIN (VALUES (6), (12), (18), (24)) AS h (mois)
+    -- seuls les prêts déjà observés pendant h mois comptent, sinon les jeunes générations paraissent saines
+    WHERE g.date_decision + h.mois * INTERVAL '1 month' <= g.date_ref
+    GROUP BY g.generation, h.mois
+),
+tableau AS (
+    SELECT generation,
+           max(nb_observes) FILTER (WHERE mois = 6)                                   AS nb_prets,
+           round(100.0 * sum(nb_defauts) FILTER (WHERE mois = 6)  / sum(nb_observes) FILTER (WHERE mois = 6), 1)  AS mob_6,
+           round(100.0 * sum(nb_defauts) FILTER (WHERE mois = 12) / sum(nb_observes) FILTER (WHERE mois = 12), 1) AS mob_12,
+           round(100.0 * sum(nb_defauts) FILTER (WHERE mois = 18) / sum(nb_observes) FILTER (WHERE mois = 18), 1) AS mob_18,
+           round(100.0 * sum(nb_defauts) FILTER (WHERE mois = 24) / sum(nb_observes) FILTER (WHERE mois = 24), 1) AS mob_24
+    FROM courbes
+    GROUP BY generation
+)
+SELECT *, mob_12 - LAG(mob_12) OVER (ORDER BY generation) AS ecart_mob_12_vs_trimestre_precedent
+FROM tableau
+ORDER BY generation;
+\end{lstlisting}
+
+\begin{resultat}[Ce que tu dois obtenir (taux de défaut cumulé, en \%)]
+\begin{center}\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+Génération & Prêts & MOB 6 & MOB 12 & MOB 18 & MOB 24 & Écart MOB 12 \\
+\midrule
+T1 2022 & 1\,820 & 2,4 & 8,3 & 14,0 & 18,3 & \\
+T2 2022 & 1\,894 & 2,3 & 7,7 & 11,9 & 16,5 & $-0{,}6$ \\
+T3 2022 & 1\,922 & 1,8 & 8,5 & 13,0 & 17,1 & 0,8 \\
+T4 2022 & 1\,836 & 1,4 & 9,0 & 13,5 & 18,4 & 0,5 \\
+T1 2023 & 1\,904 & 2,3 & 9,7 & 14,5 & 18,2 & 0,7 \\
+T2 2023 & 1\,900 & 2,8 & 9,4 & 15,4 & 19,4 & $-0{,}3$ \\
+T3 2023 & 1\,867 & 1,8 & 9,0 & 14,1 & 18,7 & $-0{,}4$ \\
+T4 2023 & 1\,879 & 2,0 & 9,8 & 14,6 & 20,2 & 0,8 \\
+T1 2024 & 1\,883 & 2,5 & 10,4 & 15,9 & 20,6 & 0,6 \\
+T2 2024 & 1\,843 & 3,3 & 10,8 & 18,0 & 23,3 & 0,4 \\
+T3 2024 & 1\,839 & 2,2 & 10,6 & 17,9 & 24,6 & $-0{,}2$ \\
+T4 2024 & 1\,931 & 2,0 & 12,4 & 19,0 & & 1,8 \\
+T1 2025 & 1\,819 & 4,3 & 14,3 & 23,5 & & 1,9 \\
+\rowcolor{rougeFond} T2 2025 & 1\,840 & 5,0 & 17,6 & & & 3,3 \\
+\rowcolor{rougeFond} T3 2025 & 1\,825 & 5,1 & 23,1 & & & 5,5 \\
+T4 2025 & 1\,568 & 2,1 & & & & \\
+T1 2026 & 1\,409 & 0,0 & & & & \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{resultat}
+
+\textbf{Lecture, et une leçon importante.} Les générations 2022--2023 sont stables (MOB 12 entre 8 et
+10~\%). À partir de fin 2024, le MOB 12 s'envole jusqu'à 23,1~\%. Dans une vraie banque, ce serait un
+signal d'alerte majeur : la politique d'octroi se serait relâchée. \textbf{Ici, c'est un artefact de la
+simulation} : chaque prêt qui a réellement fait défaut devait être en défaut au 30/09/2026 ; pour les
+prêts récents, cela oblige le défaut à arriver tôt. Pour la même raison, la génération T1 2026 n'a aucun
+défaut : les dates des prêts en défaut ont été tirées avant novembre 2025. Réflexe à garder :
+\emph{avant d'interpréter un signal, se demander s'il vient du phénomène étudié ou de la façon dont les
+données ont été construites.}
+\end{correction}
+
+\begin{correction}{2.8}
+\textbf{a)} On classe dans une CTE (avec la part de chaque prêt dans l'encours en défaut de sa note,
+grâce à une seconde fenêtre), puis on filtre le rang dans la requête englobante.
+\begin{lstlisting}[style=long]
+WITH classement AS (
+    SELECT s.note_risque, s.pret_id, c.nom_complet, s.encours, s.jours_retard,
+           RANK() OVER (PARTITION BY s.note_risque ORDER BY s.encours DESC) AS rang,
+           round(100 * s.encours / sum(s.encours) OVER (PARTITION BY s.note_risque), 2) AS part_de_la_note_pct
+    FROM v_situation_prets s
+    JOIN clients c USING (client_id)
+    WHERE s.en_defaut
+)
+SELECT * FROM classement WHERE rang <= 3 ORDER BY note_risque, rang;
+\end{lstlisting}
+
+\begin{resultat}[Extrait (21 lignes au total, noms fictifs)]
+\begin{center}\small
+\begin{tabular}{@{}clrrrcr@{}}
+\toprule
+Note & Client & Prêt & Encours (€) & Retard & Rang & Part de la note \\
+\midrule
+A & Tristan Fischer & 13 & 32\,580,44 & 446 & 1 & 0,46~\% \\
+A & Adrienne Dias & 29141 & 31\,397,09 & 243 & 2 & 0,44~\% \\
+A & Daniel Pruvost & 32159 & 31\,257,48 & 1\,052 & 3 & 0,44~\% \\
+\multicolumn{7}{c}{\dots} \\
+G & Antoine Lopez & 14759 & 23\,836,89 & 470 & 1 & 2,92~\% \\
+G & Henri Colin & 12221 & 23\,692,79 & 180 & 2 & 2,91~\% \\
+G & Thomas Robert de la Renard & 23159 & 23\,469,55 & 245 & 3 & 2,88~\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{resultat}
+
+\textbf{b) Le signal précoce.} Deux \code{LAG} sur la même fenêtre nommée, et \code{ROW_NUMBER}
+décroissant pour repérer la dernière échéance payée.
+\begin{lstlisting}[style=long]
+WITH delais AS (
+    SELECT pret_id, num_echeance,
+           date_paiement - date_echeance                                              AS retard,
+           LAG(date_paiement - date_echeance, 1) OVER w                               AS retard_precedent,
+           LAG(date_paiement - date_echeance, 2) OVER w                               AS retard_avant_precedent,
+           ROW_NUMBER() OVER (PARTITION BY pret_id ORDER BY num_echeance DESC)        AS recence
+    FROM echeancier_remboursements
+    WHERE date_paiement IS NOT NULL
+    WINDOW w AS (PARTITION BY pret_id ORDER BY num_echeance)
+)
+SELECT d.pret_id, s.note_risque, d.retard_avant_precedent, d.retard_precedent, d.retard, s.jours_retard, s.encours
+FROM delais d
+JOIN v_situation_prets s USING (pret_id)
+WHERE d.recence = 1                                            -- la dernière échéance payée
+  AND d.retard > d.retard_precedent AND d.retard_precedent > d.retard_avant_precedent
+  AND d.retard > 0
+  AND s.jours_retard <= 30
+  AND s.encours > 0                                            -- piège : sans ce filtre, on surveille des prêts soldés
+ORDER BY d.retard DESC, s.encours DESC
+LIMIT 20;
+\end{lstlisting}
+
+\begin{resultat}[Les cinq premiers des 20 prêts signalés]
+\begin{center}\small
+\begin{tabular}{@{}rcrrrrr@{}}
+\toprule
+Prêt & Note & Retard $k-2$ & Retard $k-1$ & Retard $k$ & Retard actuel & Encours (€) \\
+\midrule
+27484 & A & $-2$ & $-1$ & 40 & 26 & 11\,230,97 \\
+23306 & A & $-1$ & 37 & 40 & 26 & 1\,759,94 \\
+31436 & C & $-3$ & $-2$ & 31 & 13 & 11\,167,63 \\
+15739 & C & $-2$ & 0 & 20 & 0 & 32\,651,38 \\
+27395 & C & $-2$ & $-1$ & 20 & 0 & 21\,543,39 \\
+\bottomrule
+\end{tabular}
+\end{center}
+\end{resultat}
+
+\textbf{Pourquoi le filtre de l'ordre d'exécution ?} \code{recence}, \code{retard_precedent}\dots{} sont
+des résultats de fenêtres : impossible de les filtrer dans le \code{WHERE} de la CTE qui les calcule.
+On les filtre dans la requête suivante. \textbf{Usage métier :} ces prêts ne sont pas encore en
+difficulté, mais leurs paiements dérivent ; un appel du conseiller coûte moins cher qu'un recouvrement.
+\end{correction}
+
+% =============================================================================
+\section*{Chapitre 3}
+\addcontentsline{toc}{section}{Chapitre 3}
+
+\begin{correction}{3.4}
+\textbf{a)} La vérité terrain est chargée dans une table temporaire, qui disparaîtra à la fin de la
+session. La requête compte, sur les mêmes prêts, les défauts réels, les défauts détectés et les
+désaccords (\code{<>} entre deux booléens = « ou exclusif »).
+\begin{lstlisting}[style=long]
+CREATE TEMP TABLE verite_defauts (pret_id BIGINT PRIMARY KEY, defaut_reel SMALLINT NOT NULL);
+\copy verite_defauts FROM 'donnees/verite_defauts.csv' WITH (FORMAT csv, HEADER true)
+SELECT count(*) FILTER (WHERE v.defaut_reel = 1)                                   AS defauts_reels,
+       count(*) FILTER (WHERE d.statut_pret = 'en_defaut')                         AS defauts_detectes,
+       count(*) FILTER (WHERE (d.statut_pret = 'en_defaut') <> (v.defaut_reel = 1)) AS desaccords   -- attendu : 0
+FROM demandes_pret d
+JOIN verite_defauts v USING (pret_id);
+\end{lstlisting}
+
+\textbf{b)} Grâce à la date de référence paramétrée, « faire passer le temps » est une simple mise à
+jour, annulée à la fin.
+\begin{lstlisting}[style=long]
+BEGIN;
+UPDATE parametres_risque SET valeur_date = DATE '2027-01-31' WHERE cle = 'date_reference';
+SELECT statut_pret AS avant_traitement FROM demandes_pret WHERE pret_id = 32582;      -- « sain » : aucun événement
+CALL actualiser_statuts(32582);
+SELECT statut_pret AS apres_traitement, fn_jours_retard(32582, fn_date_reference()) AS jours_retard
+FROM demandes_pret WHERE pret_id = 32582;                                            -- « en_defaut », 98 jours
+SELECT nouveau_statut, date_effet FROM journal_statuts WHERE pret_id = 32582;
+ROLLBACK;
+\end{lstlisting}
+
+\begin{resultat}
+a) 7\,088 défauts réels, 7\,088 détectés, \textbf{0 désaccord}.\par
+b) Avant le traitement : \code{sain} (aucun événement ne s'est produit). Après : \code{en_defaut}, avec
+\textbf{98 jours} de retard. Le journal contient la ligne \code{en_defaut}, date d'effet 31/01/2027.
+\end{resultat}
+
+\textbf{Ce que prouve b).} Le passage du temps seul n'a rien déclenché : le statut était encore « sain »
+avec 98 jours de retard. C'est le traitement planifié qui l'a corrigé, et le trigger de journal a alors
+tracé le changement et envoyé l'alerte. Les deux mécanismes sont complémentaires.
+\end{correction}
+
+\begin{correction}{3.5}
+\begin{lstlisting}[style=long]
+CREATE OR REPLACE PROCEDURE cloture_mensuelle(p_date_arrete DATE)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_nb  INTEGER;
+    v_lgd NUMERIC := fn_parametre('lgd');
+BEGIN
+    IF p_date_arrete > fn_date_reference() THEN
+        RAISE EXCEPTION 'Arrêté du % impossible : postérieur à la date de référence (%)',
+                        p_date_arrete, fn_date_reference();
+    END IF;
+    INSERT INTO provisions_mensuelles (date_arrete, pret_id, jours_retard, stage_ifrs9, ead, pd_utilisee, lgd, ecl)
+    SELECT p_date_arrete, s.pret_id, s.jours_retard, c.stage, s.encours, c.pd, v_lgd,
+           round(c.pd * v_lgd * s.encours, 2)          -- l'ECL se recalcule à partir des colonnes stockées
+    FROM fn_situation_prets(p_date_arrete) s
+    JOIN demandes_pret d          ON d.pret_id = s.pret_id
+    JOIN predictions_scoring_ml ps ON ps.pret_id = s.pret_id AND ps.est_champion
+    CROSS JOIN LATERAL (SELECT fn_stage_ifrs9(s.jours_retard) AS stage) st
+    CROSS JOIN LATERAL (SELECT st.stage,
+                               round(fn_pd_ifrs9(st.stage, ps.probabilite_defaut, s.mois_restants, d.duree_mois), 6) AS pd) c
+    WHERE s.encours > 0
+    ON CONFLICT (date_arrete, pret_id) DO UPDATE           -- rejouer un arrêté remplace, ne duplique pas
+        SET jours_retard = EXCLUDED.jours_retard, stage_ifrs9 = EXCLUDED.stage_ifrs9, ead = EXCLUDED.ead,
+            pd_utilisee  = EXCLUDED.pd_utilisee,  lgd = EXCLUDED.lgd, ecl = EXCLUDED.ecl;
+    GET DIAGNOSTICS v_nb = ROW_COUNT;
+    RAISE NOTICE 'Arrêté du % : % prêts provisionnés', p_date_arrete, v_nb;
+END $$;
+
+-- Historique : les 12 derniers arrêtés de fin de mois (un CALL ne s'utilise pas dans un SELECT : bloc DO)
+DO $$
+DECLARE
+    v_mois DATE;
+BEGIN
+    FOR v_mois IN
+        SELECT (d + INTERVAL '1 month - 1 day')::date
+        FROM generate_series(DATE '2025-10-01', DATE '2026-09-01', INTERVAL '1 month') AS d
+    LOOP
+        CALL cloture_mensuelle(v_mois);
+    END LOOP;
+END $$;
+
+-- Évolution des provisions et dotation nette du mois (ce qui pèse sur le résultat de la banque)
+WITH mensuel AS (
+    SELECT date_arrete,
+           sum(ead)                                     AS ead,
+           sum(ecl)                                     AS ecl,
+           sum(ecl) FILTER (WHERE stage_ifrs9 = 1)      AS ecl_stage1,
+           sum(ecl) FILTER (WHERE stage_ifrs9 = 2)      AS ecl_stage2,
+           sum(ecl) FILTER (WHERE stage_ifrs9 = 3)      AS ecl_stage3
+    FROM provisions_mensuelles
+    GROUP BY date_arrete
+)
+SELECT date_arrete, ead, ecl, ecl_stage1, ecl_stage2, ecl_stage3,
+       ecl - LAG(ecl) OVER (ORDER BY date_arrete)       AS dotation_nette,
+       round(100 * ecl / ead, 2)                        AS taux_couverture_pct
+FROM mensuel
+ORDER BY date_arrete;
+
+-- Contrôle : rejouer le dernier arrêté ne change rien (idempotence)
+CALL cloture_mensuelle(DATE '2026-09-30');
+SELECT count(*) AS lignes_au_30_09, sum(ecl) AS ecl_au_30_09
+FROM provisions_mensuelles WHERE date_arrete = DATE '2026-09-30';
+\end{lstlisting}
+
+\textbf{\code{CROSS JOIN LATERAL}.} Une sous-requête \code{LATERAL} peut utiliser les colonnes des tables
+qui la précèdent : la première calcule le stage, la seconde la PD qui dépend du stage. C'est une façon
+lisible d'enchaîner des calculs ligne par ligne sans répéter les expressions.
+
+\begin{resultat}[Ce que tu dois obtenir (montants en millions d'euros)]
+\begin{center}\small
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+Arrêté & EAD & ECL & Stage 1 & Stage 2 & Stage 3 & Dotation nette & Couverture \\
+\midrule
+31/10/2025 & 147,01 & 21,54 & 5,03 & 1,35 & 15,16 & & 14,66~\% \\
+30/11/2025 & 146,64 & 21,94 & 4,57 & 1,39 & 15,97 & $+0{,}39$ & 14,96~\% \\
+31/12/2025 & 146,48 & 22,32 & 3,95 & 1,44 & 16,92 & $+0{,}38$ & 15,24~\% \\
+31/01/2026 & 146,26 & 22,71 & 3,40 & 1,51 & 17,80 & $+0{,}40$ & 15,53~\% \\
+28/02/2026 & 145,93 & 23,13 & 2,87 & 1,52 & 18,75 & $+0{,}42$ & 15,85~\% \\
+31/03/2026 & 145,84 & 23,62 & 2,31 & 1,57 & 19,74 & $+0{,}48$ & 16,19~\% \\
+30/04/2026 & 145,79 & 24,17 & 1,83 & 1,46 & 20,88 & $+0{,}55$ & 16,58~\% \\
+31/05/2026 & 145,56 & 24,71 & 1,42 & 1,32 & 21,97 & $+0{,}54$ & 16,97~\% \\
+30/06/2026 & 145,62 & 25,15 & 1,02 & 1,22 & 22,92 & $+0{,}44$ & 17,27~\% \\
+31/07/2026 & 141,94 & 25,46 & 0,96 & 0,59 & 23,91 & $+0{,}31$ & 17,93~\% \\
+31/08/2026 & 137,79 & 25,67 & 0,91 & 0,03 & 24,74 & $+0{,}22$ & 18,63~\% \\
+30/09/2026 & 133,96 & 25,63 & 0,86 & 0,03 & 24,74 & $-0{,}05$ & 19,13~\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+Après avoir rejoué le 30/09 : 21\,501 lignes, ECL 25\,627\,130,87~€, inchangés.
+\end{resultat}
+
+\textbf{Lecture.} Chaque mois, de nouveaux prêts passent en stage 3 : la provision augmente, et la
+\textbf{dotation nette} (environ 0,4 million par mois) pèse sur le résultat de la banque. La provision
+de stage 1 fond de 5,03 à 0,86 million : les prêts qui allaient faire défaut avaient une PD élevée et
+pesaient lourd en stage 1 ; en passant en stage 3, ils laissent en stage 1 des prêts peu risqués. En
+septembre, plus aucun nouveau défaut (le stage 3 ne bouge plus) : la dotation devient négative, c'est
+une \textbf{reprise de provision}.
+
+\textbf{Un écart de 1,72~€ ?} Le total au 30/09 (25\,627\,130,87~€) diffère de celui de l'exercice 2.2
+(25\,627\,129,15~€). Ici, la PD est arrondie à 6 décimales et l'ECL au centime \emph{prêt par prêt},
+avant la somme. Savoir expliquer un écart d'arrondi, c'est montrer qu'on contrôle ses chiffres.
+\end{correction}
+
+\begin{correction}{3.6}
+\begin{lstlisting}[style=long]
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'analyste_risque') THEN
+        CREATE ROLE analyste_risque NOLOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'application_paiement') THEN
+        CREATE ROLE application_paiement NOLOGIN;
+    END IF;
+END $$;
+
+-- L'analyste lit tout, ne modifie rien
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO analyste_risque;
+
+-- L'application d'encaissement n'écrit PAS dans les tables : elle appelle la procédure, qui s'exécute
+-- avec les droits de son propriétaire (SECURITY DEFINER). search_path figé : sinon, un utilisateur
+-- pourrait créer une fausse table ou fonction homonyme et détourner la procédure.
+ALTER PROCEDURE enregistrer_paiement(BIGINT, NUMERIC, DATE) SECURITY DEFINER SET search_path = public, pg_temp;
+REVOKE ALL ON PROCEDURE enregistrer_paiement(BIGINT, NUMERIC, DATE) FROM PUBLIC;
+GRANT EXECUTE ON PROCEDURE enregistrer_paiement(BIGINT, NUMERIC, DATE) TO application_paiement;
+
+-- Vérification (transaction annulée)
+BEGIN;
+SET LOCAL ROLE application_paiement;
+CALL enregistrer_paiement(32582, 100);                          -- autorisé : passe par la procédure
+DO $$
+BEGIN
+    UPDATE echeancier_remboursements SET montant_paye = montant_du WHERE pret_id = 32582;
+    RAISE NOTICE 'ANOMALIE : écriture directe acceptée';
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'Écriture directe refusée, comme prévu';
+END $$;
+ROLLBACK;
+\end{lstlisting}
+
+\begin{resultat}
+\code{NOTICE: Prêt 32582 : 100 € encaissés le 2026-09-30}, puis
+\code{NOTICE: Écriture directe refusée, comme prévu}.
+\end{resultat}
+
+\textbf{Pourquoi \code{NOLOGIN} ?} Ce sont des \emph{groupes} de droits. Les vrais comptes (l'analyste
+Paul, le service d'encaissement) seraient des rôles \code{LOGIN} membres de ces groupes
+(\code{GRANT analyste_risque TO paul}). \code{SET LOCAL ROLE} ne dure que jusqu'à la fin de la
+transaction : le \code{ROLLBACK} rend aussi ton rôle d'origine.
+\end{correction}

@@ -1,0 +1,347 @@
+% =============================================================================
+% Partie 2 — Problématique et objectifs
+% =============================================================================
+\chapter{Problématique et objectifs}
+
+\epigraphe{Un problème bien posé est à moitié résolu.}
+
+Ta responsable t'a donné quatre problèmes à résoudre. Avant de les traduire en SQL, il faut les
+comprendre parfaitement : ce que mesure chaque indicateur, pourquoi la définition exacte compte, et ce
+que la banque risque si on se trompe. Cette partie les pose un par un, avec des calculs à la main sur
+de vrais prêts de ta base.
+
+% -----------------------------------------------------------------------------
+\section{Les quatre problèmes métier à résoudre}
+
+\subsection{Problème 1 --- Suivre les retards de paiement (DPD)}
+
+\begin{imagine}
+Deux clients ont chacun \textbf{une} mensualité impayée. Le premier a oublié celle d'hier. Le second
+n'a pas payé celle d'il y a quatre mois, mais il a payé normalement les trois suivantes.
+
+Sont-ils dans la même situation ? Évidemment pas : le premier a un jour de retard, le second plus de
+cent. Compter les impayés ne suffit pas : il faut savoir \textbf{depuis quand} le client doit de
+l'argent.
+\end{imagine}
+
+\begin{definition}{Days Past Due (DPD), le nombre de jours de retard}
+À une date d'arrêté $t$, le DPD d'un prêt est le nombre de jours écoulés depuis \textbf{l'échéance la
+plus ancienne qui est échue et pas entièrement payée}. S'il n'y en a aucune, le DPD vaut 0.
+\[
+DPD(t) = t - \min\{\, d_k \;:\; d_k \leq t \text{ et l'échéance } k \text{ n'est pas soldée à } t \,\}
+\]
+(et $DPD(t) = 0$ si aucune échéance ne remplit ces conditions),
+où $d_k$ est la date de l'échéance numéro $k$.
+\end{definition}
+
+\begin{calcul}{le retard du prêt 61 au 30/09/2026}
+Voici les mensualités du prêt 61 autour de la date d'arrêté (704,41~€ par mois) :
+
+\begin{center}\small
+\begin{tabular}{@{}cccccl@{}}
+\toprule
+N° & Échéance & Montant dû & Payé & Date de paiement & État au 30/09 \\
+\midrule
+15 & 15/05/2026 & 704,41 & 704,41 & 18/05/2026 & soldée \\
+16 & 15/06/2026 & 704,41 & 704,41 & 15/06/2026 & soldée \\
+17 & 15/07/2026 & 704,41 & 704,41 & 03/08/2026 & soldée (avec 19 jours de retard) \\
+\rowcolor{rougeFond} 18 & 15/08/2026 & 704,41 & 0,00 & --- & \textbf{échue, impayée} \\
+19 & 15/09/2026 & 704,41 & 704,41 & 15/09/2026 & soldée \\
+20 & 15/10/2026 & 704,41 & 0,00 & --- & pas encore échue \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{enumerate}
+\item Échéances échues au 30/09 : les numéros 15 à 19 (la 20\textsuperscript{e} est dans le futur).
+\item Parmi elles, non soldées : seulement la \textbf{18} (la 19 a été payée le 15/09).
+\item La plus ancienne non soldée est donc due depuis le \textbf{15/08/2026}.
+\item $DPD = 30/09/2026 - 15/08/2026 = 16 + 30 = \mathbf{46}$ \textbf{jours}.
+\end{enumerate}
+Le prêt 61 a 46 jours de retard, bien qu'il ait payé sa dernière mensualité à l'heure.
+\end{calcul}
+
+\begin{piege}{Piège --- Trois fausses définitions du retard}
+\begin{itemize}
+\item \textbf{« Jours depuis le dernier paiement »} : pour le prêt 61, cela donnerait 15 jours (dernier
+paiement le 15/09). Faux : l'impayé d'août est masqué par le paiement de septembre.
+\item \textbf{« Nombre d'impayés × 30 »} : une mensualité impayée donnerait 30 jours. Faux : les mois
+n'ont pas tous 30 jours et l'impayé date de 46 jours.
+\item \textbf{« Jours depuis l'impayé le plus récent »} : avec plusieurs impayés, on sous-estimerait
+gravement le retard. La règle bancaire retient toujours le \textbf{plus ancien}.
+\end{itemize}
+\end{piege}
+
+\begin{observation}[Pourquoi le DPD n'est pas une colonne de la base]
+Le retard change \textbf{tous les jours}, sans qu'aucun événement ne se produise : un prêt qui a 46
+jours de retard aujourd'hui en aura 47 demain. Une colonne \code{jours_retard} stockée serait donc
+fausse dès le lendemain, sauf à la recalculer chaque nuit pour tous les prêts. On la
+\textbf{calcule} à partir des dates d'échéance et des paiements, dans une vue. C'est un principe général
+de conception : \emph{une donnée calculée et stockée finit toujours par devenir incohérente}.
+\end{observation}
+
+Pour piloter un portefeuille, on regroupe les prêts par \textbf{tranche de retard} (\emph{buckets}) :
+à jour, 1 à 30 jours, 31 à 60, 61 à 90, plus de 90 jours. On en déduit deux indicateurs suivis par
+tous les comités des risques.
+
+\begin{definition}{PAR30 et PAR90 (Portfolio At Risk)}
+Le PAR$x$ est la part de l'encours (le capital restant dû) portée par les prêts qui ont \textbf{plus
+de $x$ jours} de retard :
+\[
+PAR_x = \frac{\text{encours des prêts dont } DPD > x}{\text{encours total}}
+\]
+On le calcule en \textbf{montant}, pas en nombre de prêts : un gros prêt en retard pèse plus qu'un
+petit.
+\end{definition}
+
+\subsection{Problème 2 --- Calculer l'exposition (EAD) et les provisions}
+
+Pour un prêt amortissable, l'\textbf{exposition} (EAD) est le capital que le client doit encore. Il
+diminue à chaque mensualité : une mensualité contient une part de capital et une part d'intérêts, et
+seule la part de capital réduit la dette. Si une mensualité n'est payée qu'en partie, on considère que
+le paiement couvre capital et intérêts au prorata.
+
+La provision IFRS~9 d'un prêt est sa perte attendue, avec une probabilité de défaut dont
+\textbf{l'horizon dépend du stage} :
+
+\begin{center}\small
+\begin{tabular}{@{}cllc@{}}
+\toprule
+Stage & Condition (dans ce projet) & Horizon de la PD & PD utilisée \\
+\midrule
+1 & $DPD \leq 30$ & 12 prochains mois & $PD_{12}$ \\
+2 & $30 < DPD \leq 90$ & toute la durée restante & $PD_{\text{restante}}$ \\
+3 & $DPD > 90$ (défaut) & --- & 100~\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+\[
+\boxed{\;ECL = PD_{\text{stage}} \times LGD \times EAD\;}
+\]
+
+\subsubsection{De la PD du modèle à la PD sur 12 mois : la dérivation}
+
+Ton modèle prédit une PD sur \textbf{toute la durée} du prêt (la variable cible de ton jeu de données
+indique si le prêt a fait défaut pendant sa vie). Or le stage 1 demande une PD sur 12 mois. Comment
+passer de l'une à l'autre ?
+
+\begin{analogie}{la pièce truquée}
+Imagine qu'à chaque fin de mois, on lance une pièce truquée qui tombe sur « défaut » avec une petite
+probabilité $h$, toujours la même. Le prêt survit s'il évite « défaut » à chaque lancer. Plus le prêt
+dure, plus il y a de lancers, plus le risque cumulé augmente.
+\end{analogie}
+
+On fait donc l'hypothèse d'un \textbf{risque mensuel constant} $h$. Pour un prêt de $n$ mois :
+\begin{enumerate}
+\item Le prêt ne fait jamais défaut s'il survit aux $n$ mois : $P(\text{survie}) = (1-h)^n$.
+\item Cette probabilité vaut $1 - PD$, où $PD$ est la PD du modèle sur la durée totale :
+\[ (1-h)^n = 1 - PD \quad\Longrightarrow\quad 1 - h = (1 - PD)^{1/n} \]
+\item La probabilité de faire défaut au cours des $m$ prochains mois est donc :
+\[ PD_m = 1 - (1-h)^m = 1 - \left((1 - PD)^{1/n}\right)^m \]
+\end{enumerate}
+\[
+\boxed{\;PD_m = 1 - (1 - PD)^{m/n}\;}
+\]
+Pour le stage 1, $m = \min(\text{mois restants}, 12)$ ; pour le stage 2, $m$ = mois restants.
+
+\begin{observation}[Une hypothèse simplificatrice, à assumer en entretien]
+Les banques utilisent des « structures par terme » de PD estimées sur leur historique : le risque n'est
+pas constant (il est souvent plus élevé dans les premiers mois). L'hypothèse du risque constant est
+simple, transparente et suffisante pour ce projet. Savoir dire \emph{pourquoi} c'est une approximation
+vaut mieux qu'un modèle compliqué mal compris.
+\end{observation}
+
+\begin{calcul}{les provisions de trois prêts au 30/09/2026}
+LGD = 45~\% pour tous.
+\begin{itemize}
+\item \textbf{Prêt 67} --- 3 jours de retard : \textbf{stage 1}. EAD = 16\,680,72~€, PD du modèle
+0,0973~\%, durée 36 mois, 19 mois restants, donc $m = \min(19, 12) = 12$.
+\[ PD_{12} = 1 - (1 - 0{,}000973)^{12/36} = 0{,}0324~\% \]
+\[ ECL = 0{,}000324 \times 0{,}45 \times 16\,680{,}72 = \mathbf{2{,}43~€} \]
+\item \textbf{Prêt 61} --- 46 jours de retard : \textbf{stage 2}. EAD = 19\,578,01~€, PD 1,0725~\%,
+durée 48 mois, 29 mois restants.
+\[ PD_{29} = 1 - (1 - 0{,}010725)^{29/48} = 0{,}6494~\% \]
+\[ ECL = 0{,}006494 \times 0{,}45 \times 19\,578{,}01 = \mathbf{57{,}21~€} \]
+\item \textbf{Prêt 9} --- 388 jours de retard : \textbf{stage 3}, $PD = 100~\%$. EAD = 21\,712,35~€.
+\[ ECL = 1 \times 0{,}45 \times 21\,712{,}35 = \mathbf{9\,770{,}56~€} \]
+\end{itemize}
+Le stage pèse bien plus que la note : le prêt 9 avait une bonne note A, mais il est en défaut.
+\end{calcul}
+
+\subsection{Problème 3 --- Historiser les prédictions des modèles}
+
+Le scoring ne se fait pas une fois pour toutes. Une banque fait tourner plusieurs modèles, les
+réentraîne, change leurs seuils. Pour chaque prêt, il faut pouvoir répondre à des questions comme :
+\emph{quel modèle a décidé ? avec quel seuil ? quand ? pour quelle raison ? les autres modèles
+auraient-ils décidé autrement ?}
+
+Voici, pour le prêt 61, les trois prédictions enregistrées dans ta base :
+
+\begin{center}\small
+\begin{tabular}{@{}lcrrcl@{}}
+\toprule
+Modèle & Champion & PD & Seuil & Décision & Explication principale (SHAP) \\
+\midrule
+\code{grille_score_v1} & non & 3,69~\% & 24,0~\% & accorder & --- (623 points) \\
+\code{logistique_v1} & non & 2,66~\% & 23,5~\% & accorder & --- \\
+\code{xgboost_monotone_v2} & \textbf{oui} & 1,07~\% & 25,5~\% & accorder & \code{note_risque} : $-1{,}29$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Cette table est un \textbf{registre} : chaque ligne est une prédiction d'un modèle pour un prêt, et elle
+ne sera jamais modifiée. Ce registre sert à quatre choses :
+\begin{enumerate}
+\item \textbf{L'audit} : retrouver la version, le seuil et la date qui ont conduit à la décision.
+\item \textbf{L'explication} : répondre à un client refusé, grâce à la variable SHAP principale.
+\item \textbf{Le monitoring} : comparer, des mois plus tard, la PD prédite au défaut observé, et
+détecter qu'un modèle se dégrade.
+\item \textbf{Le champion contre les challengers} : comparer les modèles sur les mêmes prêts avant de
+changer celui qui décide.
+\end{enumerate}
+
+\begin{piege}{Piège --- Écraser le score}
+La solution naïve consiste à ajouter une colonne \code{score} dans la table des prêts et à la mettre à
+jour à chaque nouveau modèle. On perd alors tout l'historique : impossible de savoir quel modèle a
+accordé le prêt, impossible de comparer deux versions. Une prédiction est un \textbf{fait daté} : on
+l'insère, on ne la met jamais à jour.
+\end{piege}
+
+Ta base conserve aussi le \textbf{découpage apprentissage / test} de ton projet R (table
+\code{echantillons_modele}). Mesurer la performance d'un modèle sur les prêts qui ont servi à
+l'entraîner donnerait des résultats trop beaux : on l'évaluera uniquement sur les 6\,482 prêts de test.
+
+\subsection{Problème 4 --- Automatiser les alertes et le passage en défaut}
+
+Avec 32\,409 prêts, personne ne peut vérifier chaque matin lesquels ont franchi 90 jours de retard.
+Or un défaut détecté en retard fausse les provisions, les rapports au superviseur et les décisions de
+recouvrement. Il faut donc que la base applique la règle \textbf{elle-même}.
+
+Deux situations très différentes doivent être traitées :
+
+\begin{itemize}
+\item \textbf{Un événement se produit} : un paiement arrive. Le statut du prêt doit être recalculé
+immédiatement : un client qui régularise redevient \og sain \fg{}. C'est le rôle d'un
+\textbf{trigger}, une fonction que la base exécute automatiquement quand une ligne change.
+\item \textbf{Rien ne se passe} : le client ne paie plus, et les jours défilent. Le retard franchit 90
+jours \emph{sans qu'aucune ligne ne change}. Aucun trigger ne peut se déclencher : il faut un
+\textbf{traitement planifié} (le « batch de nuit ») qui recalcule les statuts de tout le portefeuille.
+\end{itemize}
+
+\begin{regle}[Règle d'or de l'automatisation]
+Un trigger réagit à un \textbf{événement} (une insertion, une modification, une suppression). Le
+\textbf{passage du temps n'est pas un événement}. Toute règle qui dépend de la date du jour demande un
+traitement planifié.
+\end{regle}
+
+Chaque changement de statut doit enfin laisser une trace : l'ancien statut, le nouveau, le retard à ce
+moment, la date et l'utilisateur. C'est le \textbf{journal d'audit}. Et un passage en défaut doit
+\textbf{alerter} le service de recouvrement : la base enverra une notification que toute application
+abonnée recevra.
+
+\begin{observation}[Pas de sortie automatique du défaut]
+Un prêt en défaut qui régularise ne redevient pas sain immédiatement. Les orientations européennes sur
+la définition du défaut imposent une \textbf{période probatoire} (au moins trois mois) avant d'en
+sortir. Ton système appliquera donc une règle asymétrique : l'entrée en défaut est automatique, la
+sortie demande une décision humaine.
+\end{observation}
+
+% -----------------------------------------------------------------------------
+\section{Les objectifs techniques}
+
+Les quatre problèmes métier se traduisent en quatre objectifs techniques, qui structurent la suite du
+cours.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}B{3.3cm} L L P{2.2cm}@{}}
+\toprule
+Objectif & Concrètement & Notions SQL & Où \\
+\midrule
+Concevoir le schéma relationnel & 8 tables reliées, des données qui ne peuvent pas être incohérentes &
+types, clés, \code{CHECK}, \code{UNIQUE}, index, transactions & Partie 3, Chapitre 1 \\
+Ingérer des volumes & 1,3 million de lignes chargées en une quinzaine de secondes, en une seule
+transaction & \code{COPY}, séquences, \code{ANALYZE} & Tâche 3 \\
+Écrire du SQL analytique performant & retards, PAR, provisions, déciles, AUC, matrices de transition,
+générations & vues, CTE, \code{FILTER}, fonctions de fenêtre, \code{ROLLUP} & Chapitre 2 \\
+Automatiser la logique métier & recalcul des statuts, journal, alertes, encaissement, clôture mensuelle &
+fonctions PL/pgSQL, triggers, procédures, rôles & Chapitre 3 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\subsection{L'architecture d'ensemble}
+
+La figure~\ref{fig:architecture} montre comment les pièces s'assemblent. Les données sources et les
+sorties de tes modèles R sont chargées par un script Python. La base contient les données \emph{et} la
+logique métier. Plusieurs utilisateurs s'y connectent, chacun avec des droits différents.
+
+\begin{figure}[ht]
+\centering
+\begin{tikzpicture}[font=\small, >=Stealth,
+  boite/.style={draw=grisTitre, fill=white, rounded corners=3pt, align=center, minimum height=0.95cm, text width=3.3cm},
+  conso/.style={draw=vertCadre, fill=vertFond, rounded corners=3pt, align=center, minimum height=0.9cm, text width=3.4cm}]
+  \node[boite] (csv) at (0,1.4) {\textbf{Prêts réels}\\{\scriptsize credit\_risk\_dataset.csv}};
+  \node[boite] (r) at (0,-0.2) {\textbf{Sorties des modèles R}\\{\footnotesize PD, SHAP, échantillons}};
+  \node[boite, draw=orangeEx, fill=orangeFond] (py) at (0,-2.1) {\textbf{Chargeur Python}\\{\footnotesize Faker, Pandas, SQLAlchemy}};
+  \draw[->, thick] (csv.west) -- ++(-0.35,0) |- (py.west);
+  \draw[->, thick] (r) -- (py);
+  % base
+  \node[draw=bleuML, fill=bleuFond, rounded corners=4pt, line width=0.9pt, minimum width=5cm,
+        minimum height=5.6cm] (db) at (5.3,-0.35) {};
+  \node[font=\footnotesize\bfseries, color=bleuML] at ([yshift=-0.35cm]db.north) {PostgreSQL --- risk\_analytics\_db};
+  \node[draw=bleuML!60, fill=white, rounded corners=2pt, text width=4.3cm, align=left, font=\footnotesize]
+    (stock) at (5.3,0.75) {\textbf{Données}\\ 8 tables, contraintes, index\\ clients, prêts, échéances,\\
+    prédictions, journal, provisions};
+  \node[draw=bleuML!60, fill=white, rounded corners=2pt, text width=4.3cm, align=left, font=\footnotesize]
+    (logique) at (5.3,-1.55) {\textbf{Logique métier}\\ 1 vue, 7 fonctions, 3 triggers,\\ 3 procédures,
+    2 rôles};
+  \draw[->, thick] (py.east) -- node[below, font=\footnotesize] {COPY} ([yshift=-1.75cm]db.west);
+  % consommateurs
+  \node[conso] (ana) at (10.9,1.75) {\textbf{Analyste risque}\\{\footnotesize DBeaver : lecture seule}};
+  \node[conso] (app) at (10.9,0.45) {\textbf{Application paiement}\\{\footnotesize CALL enregistrer\_paiement}};
+  \node[conso] (rep) at (10.9,-0.85) {\textbf{Comité, comptabilité}\\{\footnotesize provisions mensuelles}};
+  \node[conso] (ds) at (10.9,-2.15) {\textbf{Data scientist}\\{\footnotesize monitoring des modèles}};
+  \node[conso, draw=rouge, fill=rougeFond] (al) at (10.9,-3.4) {\textbf{Recouvrement}\\{\footnotesize alertes de défaut}};
+  \foreach \c in {ana,app,rep,ds} \draw[<->, thick, grisTexte] (db.east |- \c) -- (\c.west);
+  \draw[->, thick, rouge] (db.east |- al) -- node[above, font=\footnotesize] {NOTIFY} (al.west);
+\end{tikzpicture}
+\caption{L'architecture du système : des sources au pilotage du risque.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{Les critères de réussite}
+
+Comment sauras-tu que ton projet fonctionne ? Grâce à des \textbf{chiffres de contrôle}. Si tu
+retrouves les valeurs ci-dessous, ton système est correct.
+
+\begin{center}\small
+\begin{tabularx}{\linewidth}{@{}L P{4.6cm} P{2.3cm}@{}}
+\toprule
+Contrôle & Valeur attendue & Où \\
+\midrule
+Prêts, mensualités et prédictions chargés & 32\,409 / 1\,107\,936 / 97\,227 & Tâche 3 \\
+Prêts par statut après le premier traitement & 7\,088 en défaut, 933 en retard, 13\,480 sains,
+10\,909 soldés & Chapitre 3 \\
+Défauts détectés par ta logique \emph{contre} défauts réels & 7\,088 contre 7\,088, \textbf{0 désaccord} &
+Chapitre 3 \\
+PAR30 et PAR90 & 41,90~\% et 41,04~\% & Chapitre 2 \\
+Provisions totales au 30/09/2026 & environ 25,63 millions d'euros (19,13~\% de l'EAD) & Chapitres 2 et 3 \\
+AUC et Gini du champion sur l'échantillon de test & 0,923 et 0,847 & Chapitre 2 \\
+Retard d'un prêt, calculé à la demande & en moins d'une milliseconde & Chapitre 1 \\
+\bottomrule
+\end{tabularx}
+\end{center}
+
+\begin{resume}
+\begin{enumerate}
+\item Le \textbf{DPD} se mesure depuis l'échéance impayée \textbf{la plus ancienne} ; il se calcule, il
+ne se stocke pas. Les tranches de retard donnent le PAR30 et le PAR90, en montant.
+\item L'\textbf{EAD} est le capital restant dû. La provision vaut $PD \times LGD \times EAD$, avec une PD à
+12 mois (stage 1), sur la durée restante (stage 2) ou égale à 100~\% (stage 3) : $PD_m = 1-(1-PD)^{m/n}$.
+\item Les \textbf{prédictions} sont des faits datés : on les insère dans un registre, on ne les modifie
+jamais. Le registre sert à l'audit, à l'explication, au monitoring et à la comparaison des modèles.
+\item Un \textbf{trigger} réagit aux événements, un \textbf{traitement planifié} gère le passage du
+temps. L'entrée en défaut est automatique, la sortie est humaine.
+\item Quatre objectifs techniques : schéma, ingestion, SQL analytique, automatisation.
+\end{enumerate}
+\end{resume}
