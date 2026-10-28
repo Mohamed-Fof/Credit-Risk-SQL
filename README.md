@@ -81,4 +81,5 @@ executer.sh              reconstruction complète de la base
 ## Auteur
 
 **Mohamed Fofana** — Master 1 Mathématiques Appliquées, Statistique (Université Clermont Auvergne)
+
 [Portfolio](https://mohamed-fof.github.io) · [LinkedIn](https://www.linkedin.com/in/mohamed-fofana-05720a28b/)
